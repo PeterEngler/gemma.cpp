@@ -175,9 +175,14 @@ class GenerateCandidates {
 
   // The number of A and B columns to read between updating `C`.
   SizeVec KC(size_t mr, MMOrder order) const {
-    // Must return the actual value: although ignored by `RangesOfKC`, this will
-    // be used in MC() and NC().
-    if (IsOneKC(order)) return SizeVec(1, K_);
+    if (IsOneKC(order)) {
+      // A single KC range is infeasible when K exceeds the max. The caller
+      // will skip all configs with `order`.
+      if (K_ > kMaxKC) return SizeVec();
+      // Must return the actual value: although ignored by `RangesOfKC`, this
+      // will be used in MC() and NC().
+      return SizeVec(1, K_);
+    }
     // `LoopKC` handles up to `mr` rows of A.
     const size_t rows_a = HWY_MIN(max_M_, mr);
 
@@ -227,13 +232,21 @@ class GenerateCandidates {
 
   // The number of (L2 resident) A rows for `A2C0` to loop over.
   SizeVec MC(size_t mr, size_t kc, MMOrder order) const {
-    // Must return the actual value: although ignored by `RangesOfMC`, this will
-    // be used in NC().
-    if (IsOneMC(order) || max_M_ <= mr) return SizeVec(1, max_M_);
+    if (max_M_ <= mr) return SizeVec(1, max_M_);
+    if (IsOneMC(order)) {
+      // A single MC range is infeasible when M exceeds the max. The caller
+      // will skip all configs with `order`.
+      if (max_M_ > kMaxMC) return SizeVec();
+      // Must return the actual value: although ignored by `RangesOfMC`, this
+      // will be used in NC().
+      return SizeVec(1, max_M_);
+    }
 
     // Typically 12-24K. The B rows are pinned in L1, but also occupy L2 because
     // it is typically inclusive.
     const size_t bytes_b = kNR * kc * (sizeof(SfpStream) + sizeof(BF16));
+    // `kc` was chosen to fit in L1, hence this should not exceed L2.
+    HWY_ASSERT(bytes_b <= cache_.L2Bytes());
 
     // Choose the largest feasible `mc_max` (A/C rows) to maximize reuse of the
     // packed B. We want `mc * kc` elements of A to fit in L2, alongside
@@ -242,7 +255,7 @@ class GenerateCandidates {
     size_t mc_max = hwy::DivCeil(cache_.L2Bytes() - bytes_b, bytes_per_mc);
     mc_max = HWY_MIN(mc_max, HWY_MIN(kMaxBatchSize, kMaxMC));
     mc_max = HWY_MIN(mc_max, max_M_);
-    HWY_DASSERT(mc_max != 0);
+    HWY_ASSERT(mc_max != 0);
 
     SizeVec all_mc;
     all_mc.reserve(6);

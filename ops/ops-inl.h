@@ -497,7 +497,7 @@ void RMSNormBatched(const MatPtrT<XT>& activations, const MatPtr& weights,
                     size_t cluster_idx = 0) {
   HWY_DASSERT(weights.Rows() == 1);
   HWY_DASSERT(weights.Cols() == activations.Cols());
-  HWY_DASSERT(activations.SameShape(out));
+  activations.DebugCheckSameShape(out);
 
   CallUpcasted(&weights, [&](const auto* weights_t) {
     ParallelFor(ParallelismStrategy::kFlat, activations.Rows(), ctx,

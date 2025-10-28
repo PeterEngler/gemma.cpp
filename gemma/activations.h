@@ -100,6 +100,8 @@ struct AttentionActivations {
     att.OverrideRows(batch_size);
     att_out.OverrideRows(batch_size);
     att_sums.OverrideRows(batch_size);
+
+    // `inv_timescale*` are not batched.
   }
 
   MatStorageT<float> q;    // query
@@ -135,6 +137,16 @@ struct AttentionActivationsPtrs {
     att_sums = activations.att_sums;
     inv_timescale = activations.inv_timescale;
     inv_timescale_global = activations.inv_timescale_global;
+  }
+
+  void SetBatchSize(size_t batch_size) {
+    q.OverrideRows(batch_size);
+    // q_T rows are always qkv_dim!
+    pre_att_rms_out.OverrideRows(batch_size);
+    att.OverrideRows(batch_size);
+    att_out.OverrideRows(batch_size);
+    att_sums.OverrideRows(batch_size);
+    // `inv_timescale*` are not batched.
   }
 
   const ModelConfig& config;
@@ -203,6 +215,9 @@ struct Activations {
     ffw_out.OverrideRows(batch_size);
 
     attention_storage.SetBatchSize(batch_size);
+    // `AttentionActivationsPtrs` holds `MatPtrT` which also require updating;
+    // their row override is not updated when the underlying storage changes.
+    attention.SetBatchSize(batch_size);
   }
 
   const LayerConfig& layer_config;

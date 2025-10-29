@@ -57,16 +57,27 @@ static HWY_INLINE void QDotK(const size_t start_pos, const size_t last_pos,
                              const MatPtrT<KV_t>& k, float* HWY_RESTRICT att,
                              ThreadingContext& ctx, const size_t worker) {
   GCPP_ZONE(ctx, worker, Zones::kGenAttentionQDotK);
+  const hn::ScalableTag<BF16> dbf;
+  const size_t qkv_dim = k.Cols();
+  HWY_ALIGN BF16 q_bf[kMaxQKVDim];
+
+  CompressPerThread tls;
+  const hn::ScalableTag<float> df;
+  CompressTraits<BF16>::Compress(df, q, qkv_dim, tls, MakeSpan(q_bf, qkv_dim),
+                                 0);
+
   if (HWY_LIKELY(last_pos < static_cast<size_t>(div_seq_len.GetDivisor()))) {
     // Slightly faster: no wraparound.
     for (size_t pos = start_pos; pos <= last_pos; ++pos) {
-      const float score = Dot(q, k.Row(pos), k.Cols());
+      const float score =
+          Dot(dbf, MakeConstSpan(q_bf, qkv_dim), 0, k.Row(pos), qkv_dim);
       att[pos] = score;
     }
   } else {
     for (size_t pos = start_pos; pos <= last_pos; ++pos) {
       const size_t pos_modulo = div_seq_len.Remainder(pos);
-      const float score = Dot(q, k.Row(pos_modulo), k.Cols());
+      const float score =
+          Dot(dbf, MakeConstSpan(q_bf, qkv_dim), 0, k.Row(pos_modulo), qkv_dim);
       att[pos_modulo] = score;
     }
   }

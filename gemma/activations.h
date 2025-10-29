@@ -104,8 +104,8 @@ struct AttentionActivations {
     // `inv_timescale*` are not batched.
   }
 
-  MatStorageT<float> q;    // query
-  MatStorageT<float> q_T;  // Transposed to maximize attention speed.
+  MatStorageT<float> q;   // query
+  MatStorageT<BF16> q_T;  // Transposed to maximize attention speed.
 
   MatStorageT<float> pre_att_rms_out;
   MatStorageT<float> att;      // attention vector
@@ -151,7 +151,7 @@ struct AttentionActivationsPtrs {
 
   const ModelConfig& config;
   MatPtrT<float> q;
-  MatPtrT<float> q_T;
+  MatPtrT<BF16> q_T;
   MatPtrT<float> pre_att_rms_out;
   MatPtrT<float> att;
   MatPtrT<float> att_out;

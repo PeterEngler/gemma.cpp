@@ -130,7 +130,7 @@ TEST_F(GemmaTest, Multiturn) {
   // Note: we do not rewind any <end_of_turn> tokens here. If the model
   // produced one and WrapAndTokenize() inserts another one, it will just be
   // duplicated.
-  mutable_prompt = "Please repeat all prior statements.";
+  mutable_prompt = "Please repeat what I just told you.";
   tokens = WrapAndTokenize(model->Tokenizer(), model->ChatTemplate(),
                            config.wrapping, abs_pos, mutable_prompt);
 
@@ -166,6 +166,9 @@ TEST_F(GemmaTest, CrossEntropySmall) {
       break;
     case gcpp::Model::GEMMA2_27B:
       EXPECT_NEAR(entropy, 1.30f, 0.02f);
+      break;
+    case gcpp::Model::GEMMA3_270M:
+      EXPECT_NEAR(entropy, 1.41f, 0.02f);
       break;
     default:
       FAIL() << "no entropy expectation for this model";

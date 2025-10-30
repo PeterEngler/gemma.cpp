@@ -82,6 +82,7 @@ set(SOURCES
   gemma/configs.h
   gemma/flash_attention.cc
   gemma/flash_attention.h
+  gemma/flash_structs.h
   gemma/gemma_args.h
   gemma/gemma-inl.h
   gemma/gemma.cc

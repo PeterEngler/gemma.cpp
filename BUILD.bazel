@@ -543,6 +543,7 @@ cc_library(
         "gemma/activations.h",
         "gemma/attention.h",
         "gemma/flash_attention.h",
+        "gemma/flash_structs.h",
         "gemma/gemma.h",
         "gemma/vit.h",
     ],

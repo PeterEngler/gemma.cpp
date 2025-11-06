@@ -500,7 +500,7 @@ void RMSNormBatched(const MatPtrT<XT>& activations, const MatPtr& weights,
   activations.DebugCheckSameShape(out);
 
   CallUpcasted(&weights, [&](const auto* weights_t) {
-    ParallelFor(ParallelismStrategy::kFlat, activations.Rows(), ctx,
+    ParallelFor(Parallelism::kFlat, activations.Rows(), ctx,
                 cluster_idx, Callers::kOpsRMSNormBatched,
                 [&](uint64_t token_idx, size_t worker) {
                   RMSNorm(activations.Row(token_idx), weights_t->PackedScale1(),
@@ -517,7 +517,7 @@ void RMSNormInplaceBatched(const MatPtr& weights, MatPtrT<XT>& inout,
   HWY_DASSERT(weights.Cols() == inout.Cols());
 
   CallUpcasted(&weights, [&](const auto* weights_t) {
-    ParallelFor(ParallelismStrategy::kFlat, inout.Rows(), ctx, cluster_idx,
+    ParallelFor(Parallelism::kFlat, inout.Rows(), ctx, cluster_idx,
                 Callers::kOpsRMSNormInplaceBatched,
                 [&](uint64_t token_idx, size_t worker) {
                   RMSNormInplace(weights_t->PackedScale1(), /*w_ofs=*/0,
@@ -550,7 +550,7 @@ static HWY_INLINE void AddFromBatched(const MatPtrT<XT>& x, MatPtrT<float>& out,
                                       size_t cluster_idx = 0) {
   HWY_DASSERT(out.SameShape(x));
   ParallelFor(
-      ParallelismStrategy::kFlat, out.Rows(), ctx, cluster_idx,
+      Parallelism::kFlat, out.Rows(), ctx, cluster_idx,
       Callers::kOpsAddFromBatched, [&](uint64_t token_idx, size_t worker) {
         AddFrom(x.Row(token_idx), out.Row(token_idx), x.Cols(), ctx, worker);
       });
@@ -1290,7 +1290,7 @@ static HWY_INLINE HWY_MAYBE_UNUSED void MaybeLogitsSoftCapBatched(
     const float cap, MatPtrT<float>& x, const hwy::BitSet4096<>& non_eos,
     ThreadingContext& ctx, size_t cluster_idx = 0) {
   if (cap == 0.0f) return;
-  ParallelFor(ParallelismStrategy::kFlat, x.Rows(), ctx, cluster_idx,
+  ParallelFor(Parallelism::kFlat, x.Rows(), ctx, cluster_idx,
               Callers::kOpsMaybeLogitsSoftCapBatched,
               [&](uint64_t task, size_t worker) {
                 if (non_eos.Get(task)) {

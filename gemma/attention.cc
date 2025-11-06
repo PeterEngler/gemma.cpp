@@ -278,7 +278,7 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
   // Note that 2D parallelism is not worth the fork/join overhead because the
   // tasks are very lightweight.
   ParallelFor(
-      ParallelismStrategy::kFlat, kv_heads * num_interleaved, env.ctx,
+      Parallelism::kFlat, kv_heads * num_interleaved, env.ctx,
       /*cluster_idx=*/0, Callers::kAttComputeQKV,
       [&](size_t task, size_t worker) HWY_ATTR {
         const size_t head = task % kv_heads;

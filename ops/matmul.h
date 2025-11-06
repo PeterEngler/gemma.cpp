@@ -61,7 +61,7 @@ HWY_INLINE_VAR constexpr size_t kMaxNC = 16384;
 // of BF16 A and B fit in 32 KiB L1, but there may be `kMaxMR` and `kNR`.
 HWY_INLINE_VAR constexpr size_t kMaxKC = 8 * 1024;
 
-// Policy classes for parallelism, implementing some of `ParallelismStrategy`.
+// Policy classes for parallelism, implementing some of `Parallelism`.
 
 struct MMParallelNone {
   template <class Func>
@@ -220,14 +220,14 @@ struct MMParallelHierarchical {
 };
 
 template <class Func, typename... Args>
-void DispatchParallelism(ParallelismStrategy parallelism, const Func& func,
+void DispatchParallelism(Parallelism parallelism, const Func& func,
                          Args&&... args) {
   switch (parallelism) {
-    case ParallelismStrategy::kNone:
+    case Parallelism::kNone:
       return func(MMParallelNone(), std::forward<Args>(args)...);
-    case ParallelismStrategy::kWithinCluster:
+    case Parallelism::kWithinCluster:
       return func(MMParallelWithinCluster(), std::forward<Args>(args)...);
-    case ParallelismStrategy::kHierarchical:
+    case Parallelism::kHierarchical:
       return func(MMParallelHierarchical(), std::forward<Args>(args)...);
     default:
       HWY_UNREACHABLE;
@@ -716,7 +716,7 @@ class MMOptions {
   const void* opaque = nullptr;
 
   uint32_t cluster_idx = 0;  // for `parallelism == kWithinCluster`.
-  ParallelismStrategy parallelism = ParallelismStrategy::kHierarchical;
+  Parallelism parallelism = Parallelism::kHierarchical;
 };
 
 // Arguments to MatMul() that are independent of the A/B/C types. Reduces

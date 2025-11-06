@@ -1126,7 +1126,7 @@ void TestAllDot() {
     std::array<DotStats, kMaxWorkers> all_stats;
 
     ParallelFor(
-        ParallelismStrategy::kWithinCluster, kReps, ctx, 0, Callers::kTest,
+        Parallelism::kWithinCluster, kReps, ctx, 0, Callers::kTest,
         [&](size_t rep, size_t thread) {
           float* HWY_RESTRICT pa = a.Row(thread);
           float* HWY_RESTRICT pb = b.Row(thread);

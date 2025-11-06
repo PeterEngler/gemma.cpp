@@ -426,7 +426,7 @@ static void SampleAndStream(const ModelConfig& config,
   timing_info.NotifyGenerated(non_eos.Count());
 
   ParallelFor(
-      ParallelismStrategy::kFlat, qbatch.Size(), env.ctx,
+      Parallelism::kFlat, qbatch.Size(), env.ctx,
       /*cluster_idx=*/0, Callers::kSampleAndStream,
       [&](size_t qi, size_t worker) {
         if (!non_eos.Get(qi)) return;

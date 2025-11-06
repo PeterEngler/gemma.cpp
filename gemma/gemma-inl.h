@@ -70,7 +70,7 @@ template <class Mat>
 void ActivationBatched(
     ActivationType activation, Mat& c1, ThreadingContext& ctx,
     size_t cluster_idx = 0,
-    ParallelismStrategy parallelism = ParallelismStrategy::kFlat) {
+    Parallelism parallelism = Parallelism::kFlat) {
   using T = typename Mat::T;
   ParallelFor(parallelism, c1.Rows(), ctx, cluster_idx,
               Callers::kActivationBatched, [&](uint64_t task, size_t worker) {
@@ -115,7 +115,7 @@ template <class Mat1, class Mat2>
 HWY_NOINLINE void ActivationBatched(
     ActivationType activation, Mat1& c1, const Mat2* c2, ThreadingContext& ctx,
     size_t cluster_idx = 0,
-    ParallelismStrategy parallelism = ParallelismStrategy::kFlat) {
+    Parallelism parallelism = Parallelism::kFlat) {
   HWY_DASSERT(c1.SameShape(*c2));
   if (c2 && c2->HasPtr()) {
     ParallelFor(parallelism, c1.Rows(), ctx, cluster_idx,

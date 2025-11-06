@@ -85,7 +85,7 @@ static void TransposeQ(const MatPtrT<float>& q, MatPtrT<BF16>& q_t,
   {
     const size_t num_tasks = hwy::DivCeil(q_t.Rows(), kNF);
     // Better than kFlat.
-    ParallelFor(ParallelismStrategy::kHierarchical, num_tasks, ctx,
+    ParallelFor(Parallelism::kHierarchical, num_tasks, ctx,
                 /*cluster_idx=*/0, Callers::kFlashTransposeQ, func);
   }
 }
@@ -124,7 +124,7 @@ void RMSNormAndPositionalEncoding(const size_t num_tokens, const QBatch& qbatch,
   {
     // kHierarchical is not worth the extra sync overhead because the tasks are
     // very lightweight.
-    ParallelFor(ParallelismStrategy::kFlat, num_tokens * qbatch.Size(), ctx,
+    ParallelFor(Parallelism::kFlat, num_tokens * qbatch.Size(), ctx,
                 /*cluster_idx=*/0, Callers::kFlashRMSNormAndPositionalEncoding,
                 func);
   }
@@ -619,7 +619,7 @@ void FlashAttention(const size_t num_tokens, const size_t target_parallelism,
   const hwy::Divisor div_qbatch(qbatch.Size());
   // Compress q to q_bf.
   ParallelFor(
-      ParallelismStrategy::kWithinCluster, activations.q.Rows(), ctx,
+      Parallelism::kWithinCluster, activations.q.Rows(), ctx,
       /*cluster_idx=*/0, Callers::kFlashAttention,
       [&](size_t row, size_t worker) {
         CompressPerThread tls;

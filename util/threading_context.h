@@ -100,7 +100,7 @@ struct ThreadingContext {
 
   // Returns a worker index compatible with those from `ParallelFor`, assuming
   // the current thread is running on one thread per cluster, which happens
-  // when `ParallelismStrategy` is `kAcrossClusters`.
+  // when `Parallelism` is `kAcrossClusters`.
   size_t Worker(size_t cluster_idx) const {
     return cluster_idx * pools.MaxWorkersPerCluster();
   }
@@ -130,7 +130,7 @@ struct ThreadingContext {
   PROFILER_ZONE3(ctx.profiler, global_idx, ctx.profiler_zones.Get(zone_enum))
 
 // Describes the strategy for distributing parallel work across cores.
-enum class ParallelismStrategy : uint8_t {
+enum class Parallelism : uint8_t {
   // Execute using a single-threaded loop on the calling thread. The `worker`
   // index passed to the user's `Func` is unique across clusters.
   kNone,
@@ -245,19 +245,19 @@ void HierarchicalParallelFor(size_t num_tasks, ThreadingContext& ctx,
 // `cluster_idx` for `kAcrossClusters`. The `cluster_idx` argument is for
 // `parallelism == {kWithinCluster, kNone}`, and should be 0 if unknown.
 template <class Func>
-void ParallelFor(ParallelismStrategy parallelism, size_t num_tasks,
+void ParallelFor(Parallelism parallelism, size_t num_tasks,
                  ThreadingContext& ctx, size_t cluster_idx, Callers callers,
                  const Func& func) {
   HWY_DASSERT(cluster_idx < ctx.topology.NumClusters());
   if (cluster_idx != 0) {
     // If already running across clusters, only use within-cluster modes.
-    HWY_DASSERT(parallelism == ParallelismStrategy::kNone ||
-                parallelism == ParallelismStrategy::kWithinCluster);
+    HWY_DASSERT(parallelism == Parallelism::kNone ||
+                parallelism == Parallelism::kWithinCluster);
   }
   const hwy::pool::Caller caller = ctx.pool_callers.Get(callers);
 
   switch (parallelism) {
-    case ParallelismStrategy::kNone: {
+    case Parallelism::kNone: {
       const size_t worker = ctx.Worker(cluster_idx);
       for (size_t task = 0; task < num_tasks; ++task) {
         func(task, worker);
@@ -265,16 +265,16 @@ void ParallelFor(ParallelismStrategy parallelism, size_t num_tasks,
       return;
     }
 
-    case ParallelismStrategy::kAcrossClusters:
+    case Parallelism::kAcrossClusters:
       return ParallelForAcrossClusters(
           num_tasks, ctx, caller,
           [&](uint64_t task, size_t cluster_idx) { func(task, cluster_idx); });
 
-    case ParallelismStrategy::kWithinCluster:
+    case Parallelism::kWithinCluster:
       return ParallelForWithinCluster(num_tasks, ctx, cluster_idx, caller,
                                       func);
 
-    case ParallelismStrategy::kFlat:
+    case Parallelism::kFlat:
       // Choose a single pool: the only cluster, or across all clusters
       // (slower synchronization, but more memory bandwidth)
       if (HWY_UNLIKELY(ctx.pools.NumClusters() == 1)) {
@@ -286,7 +286,7 @@ void ParallelFor(ParallelismStrategy parallelism, size_t num_tasks,
                                          func(task, ctx.Worker(cluster_idx));
                                        });
 
-    case ParallelismStrategy::kHierarchical:
+    case Parallelism::kHierarchical:
       return HierarchicalParallelFor(num_tasks, ctx, callers, func);
   }
 }

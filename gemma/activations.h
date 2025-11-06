@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "gemma/configs.h"  // ModelConfig
+#include "gemma/gemma_args.h"  // AttentionImpl
 #include "ops/ops.h"        // CreateInvTimescale
 #include "util/basics.h"    // BF16
 #include "util/mat.h"       // MatStorageT
@@ -179,8 +180,8 @@ struct AttentionActivationsPtrs {
 };
 
 struct Activations {
-  Activations(const ModelConfig& config, size_t batch_size, size_t seq_len,
-              ThreadingContext& ctx,
+  Activations(const RuntimeConfig& runtime_config, const ModelConfig& config,
+              size_t batch_size, size_t seq_len, ThreadingContext& ctx,
               std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>>& row_ptrs)
       : layer_config(config.layer_configs[0]),
 
@@ -199,6 +200,7 @@ struct Activations {
         ffw_out(
             MatFactory("ffw_out", batch_size, config.model_dim, ctx.allocator)),
 
+        attention_impl(runtime_config.attention_impl),
         attention_storage(config, layer_config, batch_size, seq_len,
                           ctx.allocator, row_ptrs),
         attention(config, seq_len, attention_storage) {
@@ -247,6 +249,8 @@ struct Activations {
   MatStorageT<BF16> C1;
   MatStorageT<BF16> C2;
   MatStorageT<float> ffw_out;
+
+  AttentionImpl attention_impl;
 
   AttentionActivations attention_storage;
   AttentionActivationsPtrs attention;

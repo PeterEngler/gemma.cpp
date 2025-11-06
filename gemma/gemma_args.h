@@ -24,6 +24,7 @@
 #include <functional>
 #include <string>
 
+#include "gemma/configs.h"
 #include "io/io.h"  // Path
 #include "util/args.h"
 #include "util/basics.h"  // Tristate
@@ -138,6 +139,9 @@ struct RuntimeConfig {
   size_t top_k = 1;  // Top-k for sampling.
 
   int verbosity;  // Controls verbosity of printed messages.
+
+  // Which attention implementation to use.
+  AttentionImpl attention_impl = AttentionImpl::kFlash;
 
   // Functions operating on the generated tokens.
   StreamFunc stream_token;

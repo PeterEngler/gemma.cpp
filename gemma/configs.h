@@ -80,6 +80,34 @@ static inline bool EnumValid(LayerAttentionType type) {
   return type == LayerAttentionType::kGemma || type == LayerAttentionType::kVit;
 }
 
+enum class AttentionImpl {
+  kOld,
+  kFlash,
+};
+
+/*
+ * Returns a bitmask of flags to pass to attention functions based on the
+ * attention implementation selected.
+ *
+ * If `hwy_native_dot_bf16` is true, the function will use the old attention
+ * implementation, ignoring `impl`.
+ *
+ * `hwy_native_dot_bf16` needs to be passed in, because the HWY_NATIVE_DOT_BF16
+ * macro is not available outside of highway instrumented translation units and
+ * cannot be made accessible from .h files.
+ */
+static inline int AttentionImplToFlags(AttentionImpl impl,
+                                       int hwy_native_dot_bf16) {
+  if (hwy_native_dot_bf16) return kAttentionUseOld;
+
+  switch (impl) {
+    case AttentionImpl::kOld:
+      return kAttentionUseOld;
+    case AttentionImpl::kFlash:
+      return 0;
+  }
+}
+
 // Post attention and ffw normalization type.
 enum class PostNormType {
   None,

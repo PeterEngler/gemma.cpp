@@ -112,8 +112,9 @@ void TestFlashAttention(size_t target_parallelism) {
   RuntimeConfig runtime_config;
   KVCache kv_cache(config, inference_args, ctx.allocator);
   MatMulEnv env(ctx);
-  Activations activations(config, runtime_config.prefill_tbatch_size,
-                          kv_cache.SeqLen(), env.ctx, env.row_ptrs);
+  Activations activations(runtime_config, config,
+                          runtime_config.prefill_tbatch_size, kv_cache.SeqLen(),
+                          env.ctx, env.row_ptrs);
   std::vector<int> tokens(kOuter);
   std::iota(tokens.begin(), tokens.end(), 1);
   PromptTokens prompt(tokens);

@@ -524,6 +524,7 @@ cc_library(
     deps = [
         ":args",
         ":basics",
+        ":configs",
         ":mat",
         "//io",
         "@highway//:hwy",

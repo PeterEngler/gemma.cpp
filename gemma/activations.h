@@ -165,17 +165,32 @@ struct AttentionActivationsPtrs {
   }
 
   const ModelConfig& config;
+  // Query matrix of size batch_size x (q_heads * qkv_dim).
   MatPtrT<float> q;
+  // Query matrix of size batch_size x (q_heads * qkv_dim).
   MatPtrT<BF16> q_bf;
+  // Transposed query matrix for faster Q*K^T.
   MatPtrT<BF16> q_T;
+  // Output of RMSNorm before attention, size batch_size x model_dim.
   MatPtrT<float> pre_att_rms_out;
+  // Attention scores computed from Q*K^T, size batch_size x (q_heads *
+  // seq_len).
   MatPtrT<float> att;
+  // Attention output computed from att * V, size batch_size x (q_heads *
+  // qkv_dim).
   MatPtrT<float> att_out;
+  // Accumulation of attention outputs over heads, size batch_size x
+  // model_dim.
   MatPtrT<BF16> att_sums;
+  // Inverse timescales for RoPE computation.
   MatPtrT<float> inv_timescale;
+  // Inverse timescales for global RoPE computation.
   MatPtrT<float> inv_timescale_global;
+  // Divisor for faster division by sequence length.
   hwy::Divisor div_seq_len;
+  // Divisor for faster division by number of heads.
   hwy::Divisor div_heads;
+  // Query scaling factor for attention computation.
   float query_scale;
 };
 

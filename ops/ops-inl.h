@@ -61,6 +61,9 @@ namespace gcpp {
 namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
+// Computes C = A * B + add via MatMulStatic.
+// This function uses CallUpcasted to dispatch to the correct MatMulStatic
+// instantiation based on the runtime type of B.
 template <typename TA, typename TC>
 MMPerKey* CallMatMul(const MatPtrT<TA>& A, const MatPtr& B,
                      const float* HWY_RESTRICT add, MatMulEnv& env,

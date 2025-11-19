@@ -428,9 +428,37 @@ float HWY_INLINE SingleFlashAttentionRowVector(DF df, VF& x, float& old_max,
   return scale;
 }
 
-// Sweeps a tile of 4 Q rows by NF K timesteps accumulators from start_pos to
-// min_last_pos, then sweeps the remaining timesteps in the range (min_last_pos,
-// max_last_pos].
+// Implements flash attention for a strip of 4 query vectors.
+// It iterates through timesteps in K from `start_pos` up to `max_last_pos`.
+// Timesteps up to `min_last_pos` (*) are processed in tiles of shape 4 Q rows
+// by NF timesteps in K for efficiency while timesteps between `min_last_pos +
+// 1` and `max_last_pos` are processed one-by-one to handle differing `last_pos`
+// values within the strip.
+// (*) Actually, it only iterates through
+// `min_last_pos - (min_last_pos + 1 - start_pos) % NF` in tiles, as the tiled
+// computation can, for obvious reasons, only process an integer number of
+// tiles.
+//
+// @param q The query matrix [batch_size * q_heads, qkv_dim] in BF16 format.
+// @param q_offsets Offsets from `q.Row(0)` to the start of the 4 query
+//   vectors to be processed in this tile.
+// @param k Key matrix [seq_len, qkv_dim] from KV cache.
+// @param start_pos The first token position in the KV cache to attend to.
+// @param last_pos An array of 4 indices giving the last token position
+//   (inclusive) that each of the 4 queries may attend to.
+// @param min_last_pos The minimum value in `last_pos`. Timesteps up to this
+//   position can be processed efficiently in batches.
+// @param max_last_pos The maximum value in `last_pos`. Timesteps between
+//   `min_last_pos + 1` and this position are processed individually to
+//   respect each query's `last_pos` limit.
+// @param v Value matrix [seq_len, qkv_dim] from KV cache.
+// @param layer_idx The index of the current transformer layer.
+// @param activations Attention configurations and buffers.
+// @param att_out Output buffer for attention results.
+// @param out_offsets Offsets from `att_out.Row(0)` to store the 4 output
+//   vectors.
+// @param ctx Threading context.
+// @param worker Worker thread index.
 Tile4FlashState TileFlashAttention4(
     const MatPtrT<BF16>& q, const uint32_t* HWY_RESTRICT q_offsets,
     const MatPtrT<KV_t>& k, const size_t start_pos,

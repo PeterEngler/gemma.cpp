@@ -124,7 +124,8 @@ void TestFlashAttention(size_t target_parallelism) {
   const size_t batch_size = kOuter;
   std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>> row_ptrs;
   AttentionActivations attention_storage(config, layer_config, batch_size,
-                                         kOuter, ctx.allocator, row_ptrs);
+                                         kOuter, AttentionImpl::kFlash,
+                                         ctx.allocator, row_ptrs);
   AttentionActivationsPtrs attention(config, kOuter, attention_storage);
   const size_t qkv_dim = layer_config.qkv_dim;
   ASSERT_EQ(qkv_dim, kInner);

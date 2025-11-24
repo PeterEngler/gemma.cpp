@@ -218,7 +218,7 @@ void QDotKTile(DF df, const BF16* HWY_RESTRICT q, const size_t q_stride,
   sum6 = hn::Zero(df);
   sum7 = hn::Zero(df);
   const float* HWY_RESTRICT k_row[kHTileSize];
-  for (int i = 0; i < kHTileSize; ++i) {
+  for (size_t i = 0; i < kHTileSize; ++i) {
     k_row[i] = k.Row(k_pos[i]);
   }
 
@@ -288,15 +288,15 @@ void TileFlashAttention(
     const uint32_t* HWY_RESTRICT out_offsets, ThreadingContext& ctx,
     const size_t worker) {
   GCPP_ZONE(ctx, worker, Zones::kFlashAttentionTileFlashAttention);
-  constexpr int kHTileSize = kNFx8HTileSize;
+  constexpr size_t kHTileSize = kNFx8HTileSize;
   using DF = hn::ScalableTag<float>;
   const DF df;
   using VF = hn::Vec<DF>;
   using DI = hn::ScalableTag<uint32_t>;
   const DI di;
   using VI = hn::Vec<DI>;
-  const int kVTileSize = hn::Lanes(df);
-  for (int i = 0; i < kVTileSize; ++i) {
+  const size_t kVTileSize = hn::Lanes(df);
+  for (size_t i = 0; i < kVTileSize; ++i) {
     hwy::ZeroBytes(att_out.Row(0) + out_offsets[i],
                    v.Cols() * sizeof(att_out.Row(0)[0]));
   }

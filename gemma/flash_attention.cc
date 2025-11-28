@@ -17,13 +17,16 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 #include "compression/types.h"  // GEMMA_DISABLED_TARGETS
 #include "gemma/flash_structs.h"
 #include "util/threading_context.h"
 #include "util/zones.h"
+#include "hwy/base.h"
 #ifndef HWY_DISABLED_TARGETS
 #define HWY_DISABLED_TARGETS GEMMA_DISABLED_TARGETS
 #endif  // HWY_DISABLED_TARGETS

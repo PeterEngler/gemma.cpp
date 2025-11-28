@@ -224,7 +224,12 @@ bool BoundedTopology::InitFromTopology(const LPS& enabled_lps) {
     }
   });
   if (HWY_UNLIKELY(clusters_.empty())) {
-    HWY_WARN("Too restrictive cluster_slice or enabled_lps, no clusters left.");
+    HWY_WARN(
+        "cluster_slice [%zu, %zu), tclusters %zu, tcores %zu, tLPs %zu does not"
+        "overlap with enabled_lps 0x%zx; #LPs: %zu",
+        cluster_slice_.Begin(), cluster_slice_.End(tclusters.size()),
+        tclusters.size(), max_tcluster_cores, max_tcluster_lps,
+        static_cast<size_t>(enabled_lps.Get64()), topology_.lps.size());
     return false;
   }
 

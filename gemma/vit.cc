@@ -78,13 +78,9 @@ class VitAttention {
     const float query_scale = 1.0f / sqrtf(static_cast<float>(qkv_dim));
     PROFILER_ZONE("Gen.VitAttention.DotSoftmax");
 
-    // Shift Q, K, VT to MatStorageT.
-    MatStorageT<float> Q("Q2", Extents2D(num_tokens_, qkv_dim),
-                         env_.ctx.allocator, MatPadding::kPacked);
-    MatStorageT<float> K("K2", Extents2D(seq_len, qkv_dim), env_.ctx.allocator,
-                         MatPadding::kPacked);
-    MatStorageT<float> C("C2", Extents2D(num_tokens_, seq_len),
-                         env_.ctx.allocator, MatPadding::kPacked);
+    MatPtrT<float>& Q = activations_.attention.vit_Q;
+    MatPtrT<float>& K = activations_.attention.vit_K;
+    MatPtrT<float>& C = activations_.attention.vit_C;
 
     // Initialize att_out to zero prior to head loop.
     ZeroInit(activations_.attention.att_out);

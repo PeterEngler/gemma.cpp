@@ -129,11 +129,15 @@ void ReplGemma(const ThreadingArgs& threading, const InferenceArgs& inference,
   // callback function invoked for each generated token.
   auto batch_stream_token = [&](size_t query_idx, size_t pos, int token,
                                 float) {
-    std::string token_text;
-    HWY_ASSERT(gemma.Tokenizer().Decode(std::vector<int>{token}, &token_text));
-
     HWY_ASSERT(pos == abs_pos);
     ++abs_pos;
+
+    std::string token_text;
+    if (!gemma.Tokenizer().Decode(std::vector<int>{token}, &token_text)) {
+      if (token == -2) return true;  // Gemma 3 ViT?
+      HWY_WARN("Failed to decode token %d.", token);
+    }
+
     const bool in_prompt = tokens_generated_this_turn < prompt_size;
     const bool first_response_token = tokens_generated_this_turn == prompt_size;
     ++tokens_generated_this_turn;

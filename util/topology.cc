@@ -27,6 +27,7 @@ namespace gcpp {
 // Returns set of LPs available for use.
 static LPS EnabledLPs(const BoundedSlice& lp_slice) {
   LPS enabled_lps;
+  const size_t num_lps = hwy::TotalLogicalProcessors();
 
   // Thread-safe caching during the first call because subsequent pinning
   // overwrites the main thread's affinity.
@@ -35,6 +36,7 @@ static LPS EnabledLPs(const BoundedSlice& lp_slice) {
     if (!GetThreadAffinity(affinity)) affinity = LPS();
     return affinity;
   }();
+
   if (HWY_LIKELY(affinity.Any())) {
     // To honor taskset/numactl *and* the users's `lp_slice`, we interpret
     // the latter as a slice of the 1-bits of `enabled_lps`. Note that this
@@ -48,17 +50,31 @@ static LPS EnabledLPs(const BoundedSlice& lp_slice) {
       }
       ++enabled_idx;
     });
-  } else {
-    const size_t num_lps = hwy::TotalLogicalProcessors();
-    // Do not warn on Apple, where affinity is not supported.
-    if (!HWY_OS_APPLE) {
-      HWY_WARN("unknown OS affinity, max %zu LPs and slice %zu.", num_lps,
-               lp_slice.Num(num_lps));
+  }
+
+  if (HWY_UNLIKELY(!enabled_lps.Any())) {
+    // First warn: either about unknown affinity, or no overlap with `lp_slice`.
+    if (!affinity.Any()) {
+      // Do not warn on Apple, where affinity is not supported.
+      if (!HWY_OS_APPLE) {
+        HWY_WARN("unknown OS affinity, max %zu LPs and slice %zu.", num_lps,
+                 lp_slice.Num(num_lps));
+      }
+    } else {
+      HWY_WARN("LP slice [%zu, %zu) of initial affinity %zu is empty.",
+               lp_slice.Begin(), lp_slice.End(num_lps), affinity.Count());
     }
+
+    // Set `enabled_lps` based only on `lp_slice` and total logical processors.
     for (size_t lp = 0; lp < num_lps; ++lp) {
       if (lp_slice.Contains(num_lps, lp)) {
         enabled_lps.Set(lp);
       }
+    }
+
+    if (!enabled_lps.Any()) {
+      HWY_WARN("no enabled LPs of total %zu, slice [%zu, %zu).", num_lps,
+               lp_slice.Begin(), lp_slice.End(affinity.Count()));
     }
   }
 
@@ -72,6 +88,7 @@ static LPS EnabledLPs(const BoundedSlice& lp_slice) {
     HWY_WARN("Warning, threads not supported, using only the main thread.");
   }
 
+  HWY_ASSERT(enabled_lps.Any());
   return enabled_lps;
 }
 
@@ -225,11 +242,12 @@ bool BoundedTopology::InitFromTopology(const LPS& enabled_lps) {
   });
   if (HWY_UNLIKELY(clusters_.empty())) {
     HWY_WARN(
-        "cluster_slice [%zu, %zu), tclusters %zu, tcores %zu, tLPs %zu does not"
-        "overlap with enabled_lps 0x%zx; #LPs: %zu",
+        "cluster_slice [%zu, %zu), tclusters %zu, tcores %zu, tLPs %zu, "
+        "#LPs: %zu does not overlap with %zu enabled LPs: ",
         cluster_slice_.Begin(), cluster_slice_.End(tclusters.size()),
         tclusters.size(), max_tcluster_cores, max_tcluster_lps,
-        static_cast<size_t>(enabled_lps.Get64()), topology_.lps.size());
+        topology_.lps.size(), enabled_lps.Count());
+    enabled_lps.Foreach([](size_t lp) { fprintf(stderr, "%zu, ", lp); });
     return false;
   }
 

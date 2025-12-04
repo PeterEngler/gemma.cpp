@@ -187,12 +187,12 @@ void DotSoftmaxWeightedSum(const size_t num_tokens, const size_t layer_idx,
     GCPP_ZONE(ctx, worker, Zones::kGenAttentionDotSoftmaxWeightedSumPar);
 
     const size_t qi = div_qbatch.Remainder(tq_idx);
-    const size_t batch_idx = div_qbatch.Divide(tq_idx);
+    const size_t token_idx = div_qbatch.Divide(tq_idx);
     auto& kv_cache = qbatch.KV(qi).kv_cache;
 
     // Find the token position in the query and calculate
     // the range of cache positions to attend to.
-    const size_t pos = qbatch.Pos(qi) + batch_idx;
+    const size_t pos = qbatch.Pos(qi) + token_idx;
     const size_t start_pos = StartPos(pos, activations.config, layer_idx);
     size_t last_pos = pos;
     const size_t prefix_end = qbatch.PrefixEnd(qi);

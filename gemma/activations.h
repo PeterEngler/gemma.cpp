@@ -198,6 +198,12 @@ struct AttentionActivationsPtrs {
   }
 
   const ModelConfig& config;
+
+  // For the matrices below, the batch_size dimension is really qbatch.Size() *
+  // token_batch_size, but in all known uses, one of those is 1.  Specifically,
+  // during PrefillTBatch, it is prompt length (up to some max batch size)
+  // and otherwise it's qbatch.Size().
+
   // Query matrix of size batch_size x (q_heads * qkv_dim).
   MatPtrT<float> q;
   // Query matrix of size batch_size x (q_heads * qkv_dim).

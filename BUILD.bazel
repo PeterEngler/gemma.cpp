@@ -601,6 +601,28 @@ cc_library(
     ],
 )
 
+cc_test(
+    name = "gemma_lib_test",
+    srcs = ["gemma/attention_test.cc"],
+    deps = [
+        ":configs",
+        ":gemma_args",
+        ":gemma_lib",
+        ":kv_cache",
+        ":mat",
+        ":matmul_env",
+        ":test_util",
+        ":threading_context",
+        ":weights",
+        "@googletest//:gtest_main",  # buildcleaner: keep
+        "//third_party/absl/types:span",
+        "//compression:compress",
+        "//compression:types",
+        "@highway//:hwy",
+        "@highway//:hwy_test_util",
+    ],
+)
+
 cc_library(
     name = "cross_entropy",
     srcs = ["evals/cross_entropy.cc"],

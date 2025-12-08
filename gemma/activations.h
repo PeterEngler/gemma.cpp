@@ -25,6 +25,7 @@
 
 #include "gemma/configs.h"  // ModelConfig
 #include "gemma/gemma_args.h"  // AttentionImpl
+#include "gemma/kv_cache.h"
 #include "ops/ops.h"        // CreateInvTimescale
 #include "util/basics.h"    // BF16
 #include "util/mat.h"       // MatStorageT

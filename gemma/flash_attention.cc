@@ -425,9 +425,14 @@ float HWY_INLINE SingleFlashAttentionRowVector(DF df, VF& x, float& old_max,
   float scale = old_d * std::exp(old_max - m);
   old_d = hn::ReduceSum(df, x) + scale;
   old_max = m;
-  float one_over_d = 1.0f / old_d;
-  scale *= one_over_d;
-  x = hn::Mul(x, hn::Set(df, one_over_d));
+  if (old_d > 0.0f) {
+    const float one_over_d = 1.0f / old_d;
+    scale *= one_over_d;
+    x = hn::Mul(x, hn::Set(df, one_over_d));
+  } else {
+    scale = 0.0f;
+    x = hn::Zero(df);
+  }
   return scale;
 }
 

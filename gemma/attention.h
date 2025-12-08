@@ -51,6 +51,8 @@ namespace gcpp {
                       const LayerWeightsPtrs& layer,                          \
                       AttentionActivationsPtrs& activations, QBatch& qbatch,  \
                       MatMulEnv& env, int flags);                             \
+  void SumHeads(const LayerWeightsPtrs& layer,                                \
+                AttentionActivationsPtrs& activations, MatMulEnv& env);       \
   /* NOLINTNEXTLINE(google-readability-namespace-comments) */                 \
   }  // namespace NAMESPACE
 

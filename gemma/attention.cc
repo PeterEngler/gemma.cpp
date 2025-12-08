@@ -321,9 +321,8 @@ static HWY_INLINE void ComputeQKV(size_t num_tokens, const size_t layer_idx,
 
 // Sums encoded (`att_out`) over num_heads (`layer_config.heads`) and
 // head_dim (`qkv_dim`) into output (`layer_out`).
-static HWY_INLINE void SumHeads(const LayerWeightsPtrs& layer,
-                                AttentionActivationsPtrs& activations,
-                                MatMulEnv& env) {
+void SumHeads(const LayerWeightsPtrs& layer,
+              AttentionActivationsPtrs& activations, MatMulEnv& env) {
   GCPP_ZONE(env.ctx, hwy::Profiler::GlobalIdx(), Zones::kGenAttentionSumHeads);
   const LayerConfig& layer_config = layer.layer_config;
   (void)layer_config;  // For HWY_DASSERT

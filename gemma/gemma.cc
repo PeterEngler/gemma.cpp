@@ -21,10 +21,12 @@
 #include <optional>
 
 #include "compression/types.h"  // GEMMA_DISABLED_TARGETS
-#include "util/zones.h"
 #ifndef HWY_DISABLED_TARGETS
 #define HWY_DISABLED_TARGETS GEMMA_DISABLED_TARGETS
 #endif  // HWY_DISABLED_TARGETS
+
+#include "gemma/tensor_stats.h"
+#include "util/zones.h"
 
 // Compiles this file for multiple architectures via "foreach_target.h", to
 // which we pass the filename via macro 'argument'.
@@ -568,12 +570,26 @@ static void StreamAndUpdateEOSAfterPrefill(const ModelConfig& config,
                      config, runtime_config, qbatch, update_pos, non_eos);
 }
 
+void SetWeightStats(const LayerWeightsPtrs& layer, Activations& a,
+                    ThreadingContext& ctx) {
+  const size_t layer_idx = layer.layer_idx;
+  a.s_w_gating_einsum_w1.Notify(layer_idx, layer.gating_einsum_w1, ctx,
+                                kTensorStatsIsWeight);
+  a.s_w_gating_einsum_w2.Notify(layer_idx, layer.gating_einsum_w2, ctx,
+                                kTensorStatsIsWeight);
+  a.s_w_linear_w.Notify(layer_idx, layer.linear_w, ctx, kTensorStatsIsWeight);
+}
+
 // Decode: generates one continuation token for each query in `qbatch`.
 static void GenerateT(const ModelConfig& config,
                       const RuntimeConfig& runtime_config,
                       const AesCtrEngine& engine, const WeightsPtrs& weights,
                       Activations& activations, QBatch& qbatch, MatMulEnv& env,
                       TimingInfo& timing_info) {
+  for (const LayerWeightsPtrs& layer : weights.c_layers) {
+    SetWeightStats(layer, activations, env.ctx);
+  }
+
   const size_t max_gen_steps = PrefillTBatchOrQBatch(
       config, runtime_config, weights, activations, qbatch, env, timing_info);
 

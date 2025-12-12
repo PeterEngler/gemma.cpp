@@ -23,6 +23,7 @@
 #include <stdint.h>
 
 // IWYU pragma: begin_exports
+#include "io/io.h"  // Path
 #include "util/allocator.h"
 #include "util/args.h"
 #include "util/basics.h"  // Tristate
@@ -55,6 +56,8 @@ class ThreadingArgs : public ArgsBase<ThreadingArgs> {
   Tristate pin;        // pin threads?
   Tristate spin;       // use spin waits?
 
+  Path tensor_output;  // empty, or directory for tensor output
+
   template <class Visitor>
   void ForEach(const Visitor& visitor) {
     // These can be used to partition CPU packages/sockets and their
@@ -85,6 +88,9 @@ class ThreadingArgs : public ArgsBase<ThreadingArgs> {
 
     visitor(bind, "bind", Tristate::kDefault,
             "Bind memory to sockets? -1 = auto, 0 = no, 1 = yes.", 2);
+
+    visitor(tensor_output, "tensor_output", Path(),
+            "Empty, or directory for tensor output.", 2);
   }
 };
 
@@ -124,6 +130,8 @@ struct ThreadingContext {
 
   // Per-package/cluster/within cluster pools of threads, matching `topology`.
   NestedPools pools;
+
+  Path tensor_output;  // used by `TensorStats::Notify`.
 };
 
 #define GCPP_ZONE(ctx, global_idx, zone_enum) \

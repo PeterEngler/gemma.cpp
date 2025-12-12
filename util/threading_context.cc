@@ -97,7 +97,8 @@ ThreadingContext::ThreadingContext(const ThreadingArgs& args)
                BoundedSlice(args.skip_lps, args.max_lps)),
       cache_info(topology),
       allocator(topology, cache_info, args.bind != Tristate::kFalse),
-      pools(topology, allocator, args.max_threads, args.pin) {
+      pools(topology, allocator, args.max_threads, args.pin),
+      tensor_output(args.tensor_output) {
   PROFILER_ZONE("Startup.ThreadingContext autotune");
   TunePools(hwy::PoolWaitMode::kSpin, *this);
   // kBlock is the default, hence set/tune it last.

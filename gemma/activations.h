@@ -23,12 +23,13 @@
 #include <atomic>
 #include <vector>
 
-#include "gemma/configs.h"  // ModelConfig
+#include "gemma/configs.h"     // ModelConfig
 #include "gemma/gemma_args.h"  // AttentionImpl
 #include "gemma/kv_cache.h"
-#include "ops/ops.h"        // CreateInvTimescale
-#include "util/basics.h"    // BF16
-#include "util/mat.h"       // MatStorageT
+#include "gemma/tensor_stats.h"
+#include "ops/ops.h"      // CreateInvTimescale
+#include "util/basics.h"  // BF16
+#include "util/mat.h"     // MatStorageT
 #include "util/threading_context.h"
 
 namespace gcpp {
@@ -268,6 +269,14 @@ struct Activations {
         ffw_out(
             MatFactory("ffw_out", batch_size, config.model_dim, ctx.allocator)),
 
+        max_workers(ctx.pools.MaxWorkers()),
+        s_ffw_in(config.num_layers, max_workers),
+        s_ffw_hidden(config.num_layers, max_workers),
+        s_ffw_out(config.num_layers, max_workers),
+
+        s_w_gating_einsum_w1(config.num_layers, max_workers),
+        s_w_gating_einsum_w2(config.num_layers, max_workers),
+        s_w_linear_w(config.num_layers, max_workers),
         attention_impl(runtime_config.attention_impl),
         attention_storage(config, layer_config, batch_size, seq_len,
                           runtime_config.attention_impl, ctx.allocator,
@@ -286,6 +295,12 @@ struct Activations {
     ffw_out.AllocateAndAttachRowPtrs(row_ptrs);
 
     // Note that BindC on any MatMul output considerably slows down Prefill.
+  }
+
+  ~Activations() {
+    s_ffw_in.ReduceAndPrint("ffw_in");
+    s_ffw_hidden.ReduceAndPrint("ffw_hidden");
+    s_ffw_out.ReduceAndPrint("ffw_out");
   }
 
   // Negligible CPU time.
@@ -318,6 +333,15 @@ struct Activations {
   MatStorageT<BF16> C1;
   MatStorageT<BF16> C2;
   MatStorageT<float> ffw_out;
+
+  const size_t max_workers;
+  TensorStats s_ffw_in;
+  TensorStats s_ffw_hidden;  // after Activation+gating
+  TensorStats s_ffw_out;
+
+  TensorStats s_w_gating_einsum_w1;
+  TensorStats s_w_gating_einsum_w2;
+  TensorStats s_w_linear_w;
 
   AttentionImpl attention_impl;
 

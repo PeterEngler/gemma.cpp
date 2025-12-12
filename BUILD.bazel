@@ -112,6 +112,7 @@ cc_library(
         ":threading",
         ":topology",
         ":zones",
+        "//io",
         "@highway//:hwy",
         "@highway//:hwy_test_util",
         "@highway//:profiler",
@@ -555,6 +556,7 @@ cc_library(
         "gemma/attention.cc",
         "gemma/flash_attention.cc",
         "gemma/gemma.cc",
+        "gemma/tensor_stats.cc",
         "gemma/vit.cc",
     ],
     hdrs = [
@@ -563,6 +565,7 @@ cc_library(
         "gemma/flash_attention.h",
         "gemma/flash_structs.h",
         "gemma/gemma.h",
+        "gemma/tensor_stats.h",
         "gemma/vit.h",
     ],
     exec_properties = {
@@ -597,6 +600,7 @@ cc_library(
         "@highway//:hwy",
         "@highway//:nanobenchmark",  # timer
         "@highway//:profiler",
+        "@highway//:stats",
         "@highway//:thread_pool",
         "@highway//hwy/contrib/sort:vqsort",
     ] +

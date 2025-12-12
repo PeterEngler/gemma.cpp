@@ -1,4 +1,4 @@
-# Weight compression and analysis.
+# Compressed tensor types.
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -206,21 +206,5 @@ cc_test(
         "//:threading_context",
         "@highway//:hwy",
         "@highway//:hwy_test_util",
-    ],
-)
-
-# For internal experimentation
-cc_library(
-    name = "analyze",
-    textual_hdrs = ["analyze.h"],
-    deps = [
-        ":int",
-        ":nuq",
-        ":sfp",
-        ":types",
-        "@highway//:hwy",
-        "@highway//:stats",
-        "@highway//:thread_pool",
-        "@highway//hwy/contrib/sort:vqsort",
     ],
 )

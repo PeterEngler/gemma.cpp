@@ -196,9 +196,9 @@ std::unique_ptr<File> OpenFileOrNull(const Path& filename, const char* mode) {
 namespace gcpp {
 
 std::unique_ptr<File> OpenFileOrAbort(const Path& filename, const char* mode) {
-  std::unique_ptr<File> file = OpenFileOrNull(filename, "r");
+  std::unique_ptr<File> file = OpenFileOrNull(filename, mode);
   if (!file) {
-    HWY_ABORT("Failed to open %s", filename.path.c_str());
+    HWY_ABORT("Failed to open %s, errno %d", filename.path.c_str(), errno);
   }
   return file;
 }

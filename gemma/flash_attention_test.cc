@@ -112,7 +112,9 @@ void TestFlashAttention(size_t target_parallelism) {
   const LayerConfig& layer_config = config.layer_configs[0];
   const LayerWeightsPtrs layers(0, layer_config, tensor_info_registry);
   InferenceArgs inference_args;
+  inference_args.attention_impl = "flash";
   RuntimeConfig runtime_config;
+  inference_args.CopyTo(runtime_config);
   KVCache kv_cache(config, inference_args, ctx.allocator);
   MatMulEnv env(ctx);
   Activations activations(runtime_config, config,
@@ -127,8 +129,8 @@ void TestFlashAttention(size_t target_parallelism) {
   const size_t batch_size = kOuter;
   std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>> row_ptrs;
   AttentionActivations attention_storage(config, layer_config, batch_size,
-                                         kOuter, AttentionImpl::kFlash,
-                                         ctx.allocator, row_ptrs);
+                                         kOuter, runtime_config, ctx.allocator,
+                                         row_ptrs);
   AttentionActivationsPtrs attention(config, kOuter, attention_storage);
   const size_t qkv_dim = layer_config.qkv_dim;
   ASSERT_EQ(qkv_dim, kInner);

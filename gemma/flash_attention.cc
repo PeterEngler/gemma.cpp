@@ -35,7 +35,6 @@
 
 #include "gemma/activations.h"
 #include "gemma/configs.h"  // kMaxQKVDim
-#include "gemma/gemma.h"
 #include "util/threading.h"
 #include "hwy/profiler.h"
 
@@ -114,8 +113,7 @@ void RMSNormAndPositionalEncoding(const size_t num_tokens, const QBatch& qbatch,
       // Find the token position in the query and calculate
       // the range of cache positions to attend to.
       constexpr size_t offset = 0;  // placeholder, do not remove
-      const size_t pos =
-          qbatch.Pos(qi) + batch_idx + offset;
+      const size_t pos = qbatch.Pos(qi) + batch_idx + offset;
       float* HWY_RESTRICT q_row = q.Row(tq_idx) + h * layer_config.qkv_dim;
       // Apply rope and scaling to Q.
       if (query_norm_scale.HasPtr()) {

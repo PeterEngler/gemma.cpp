@@ -20,7 +20,10 @@
 
 #include <stddef.h>
 
-#include "gemma/gemma.h"
+#include "gemma/activations.h"
+#include "gemma/query.h"
+#include "gemma/weights.h"
+#include "ops/matmul.h"
 #include "hwy/highway.h"
 
 namespace gcpp {

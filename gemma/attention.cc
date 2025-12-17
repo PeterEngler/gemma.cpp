@@ -26,7 +26,6 @@
 
 #include "gemma/activations.h"
 #include "gemma/configs.h"  // kMaxQKVDim
-#include "gemma/gemma.h"
 #include "gemma/weights.h"
 #include "util/threading.h"
 #include "util/threading_context.h"

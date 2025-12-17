@@ -23,7 +23,7 @@
 #include <cstdint>
 
 #include "gemma/flash_structs.h"
-#include "gemma/gemma.h"
+#include "gemma/query.h"
 #include "hwy/highway.h"
 
 namespace gcpp {

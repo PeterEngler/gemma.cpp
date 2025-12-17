@@ -135,6 +135,8 @@ cc_test(
     name = "flash_attention_test",
     srcs = ["gemma/flash_attention_test.cc"],
     deps = [
+        ":activations",
+        ":attention",
         ":configs",
         ":gemma_args",
         ":gemma_lib",
@@ -439,6 +441,7 @@ cc_test(
     # for test_suite.
     tags = ["ops_tests"],
     deps = [
+        ":activations",
         ":allocator",
         ":basics",
         ":configs",
@@ -538,6 +541,21 @@ cc_test(
 )
 
 cc_library(
+    name = "activations",
+    hdrs = ["gemma/activations.h"],
+    deps = [
+        ":basics",
+        ":configs",
+        ":gemma_args",
+        ":kv_cache",
+        ":mat",
+        ":ops",
+        ":tensor_stats",
+        ":threading_context",
+    ],
+)
+
+cc_library(
     name = "query",
     hdrs = ["gemma/query.h"],
     deps = [
@@ -573,31 +591,21 @@ cc_test(
 )
 
 cc_library(
-    name = "gemma_lib",
+    name = "attention",
     srcs = [
         "gemma/attention.cc",
         "gemma/flash_attention.cc",
-        "gemma/gemma.cc",
-        "gemma/tensor_stats.cc",
-        "gemma/vit.cc",
     ],
     hdrs = [
-        "gemma/activations.h",
         "gemma/attention.h",
         "gemma/flash_attention.h",
         "gemma/flash_structs.h",
-        "gemma/gemma.h",
-        "gemma/tensor_stats.h",
-        "gemma/vit.h",
     ],
-    exec_properties = {
-        # Avoid linker OOMs when building with sanitizer instrumentation.
-        "mem": "28g",
-    },
     textual_hdrs = [
         "gemma/gemma-inl.h",
     ],
     deps = [
+        ":activations",
         ":allocator",
         ":basics",
         ":configs",
@@ -606,10 +614,71 @@ cc_library(
         ":mat",
         ":matmul",
         ":matmul_env",
+        ":ops",
+        ":query",
+        ":tensor_stats",
+        ":threading",
+        ":threading_context",
+        ":weights",
+        ":zones",
+        "//compression:compress",
+        "//compression:types",
+        "//io",
+        "@highway//:bit_set",
+        "@highway//:hwy",
+        "@highway//:nanobenchmark",  # timer
+        "@highway//:profiler",
+        "@highway//:thread_pool",
+        "@highway//hwy/contrib/sort:vqsort",
+    ],
+)
+
+cc_library(
+    name = "tensor_stats",
+    srcs = ["gemma/tensor_stats.cc"],
+    hdrs = ["gemma/tensor_stats.h"],
+    deps = [
+        ":basics",
+        ":mat",
+        ":ops",
+        ":threading_context",
+        ":zones",
+        "//compression:compress",
+        "//io",
+        "@highway//:hwy",
+        "@highway//:profiler",
+        "@highway//:stats",
+    ],
+)
+
+cc_library(
+    name = "gemma_lib",
+    srcs = [
+        "gemma/gemma.cc",
+        "gemma/vit.cc",
+    ],
+    hdrs = [
+        "gemma/gemma.h",
+        "gemma/vit.h",
+    ],
+    exec_properties = {
+        # Avoid linker OOMs when building with sanitizer instrumentation.
+        "mem": "28g",
+    },
+    deps = [
+        ":activations",
+        ":allocator",
+        ":attention",
+        ":basics",
+        ":configs",
+        ":gemma_args",
+        ":kv_cache",
+        ":mat",
+        ":matmul_env",
         ":model_store",
         ":ops",
         ":query",
-        ":threading",
+        ":tensor_stats",
         ":threading_context",
         ":weights",
         ":zones",
@@ -618,7 +687,6 @@ cc_library(
         "//io",
         "//io:blob_store",
         "//paligemma:image",
-        "@highway//:bit_set",
         "@highway//:hwy",
         "@highway//:nanobenchmark",  # timer
         "@highway//:profiler",
@@ -636,6 +704,8 @@ cc_test(
     # MatMulEnvs are up to 20GB large.
     tags = ["requires-mem:28g"],
     deps = [
+        ":activations",
+        ":attention",
         ":configs",
         ":gemma_args",
         ":gemma_lib",

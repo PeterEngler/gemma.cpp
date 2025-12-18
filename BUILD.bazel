@@ -8,7 +8,7 @@ load("@rules_license//rules:license.bzl", "license")
 
 package(
     default_applicable_licenses = [
-        "//:license",  # Placeholder comment, do not modify
+        ":license",  # Placeholder comment, do not modify
     ],
     # Placeholder for internal compatible_with
     default_visibility = ["//visibility:public"],

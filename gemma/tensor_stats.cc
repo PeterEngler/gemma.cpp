@@ -107,6 +107,98 @@ void MaybeWriteRow(const std::unique_ptr<File>& file, const MatPtr& type_erased,
               bytes_per_row * row_idx);
 }
 
+constexpr size_t kGroupSize = 128;  // subchannel
+
+void QuantizeGroup(const float* HWY_RESTRICT in,
+                   TensorStatsAccumulator& my_stats) {
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<float> df;
+  using VF = hn::Vec<decltype(df)>;
+  using MF = hn::Mask<decltype(df)>;
+  const hn::ScalableTag<double> dd;
+  using VD = hn::Vec<decltype(dd)>;
+  HWY_LANES_CONSTEXPR size_t NF = hn::Lanes(df);
+  HWY_ALIGN float enc[kGroupSize];
+  HWY_ALIGN float dec[kGroupSize];
+  HWY_ALIGN float all_snr[kGroupSize];
+  HWY_DASSERT(kGroupSize % NF == 0);  // No remainder handling required.
+
+  const VF k0 = hn::Zero(df);
+  const VF k1 = hn::Set(df, 1.0f);
+
+  // Scan for min/max for quantization.
+  VF vmin = hn::Set(df, hwy::HighestValue<float>());
+  VF vmax = hn::Set(df, hwy::LowestValue<float>());
+  for (size_t i = 0; i < kGroupSize; i += NF) {
+    const VF v = hn::Load(df, in + i);
+    vmin = hn::Min(vmin, v);
+    vmax = hn::Max(vmax, v);
+  }
+  const float min = hn::ReduceMin(df, vmin);
+  const float max = hn::ReduceMax(df, vmax);
+  // Avoid division by zero during quantization.
+  if (max == min) return;
+
+  // Distortion stats.
+  VF vsum_err = hn::Zero(df);
+  VD sum_log_snr0 = hn::Zero(dd);
+  VD sum_log_snr1 = hn::Zero(dd);
+  size_t num_snr = 0;
+
+  // Unclipped asymmetric quantization (for activations).
+  const VF scale = hn::Set(df, 255.0f / (max - min));
+  const VF inv_scale = hn::Div(k1, scale);
+  const VF zeropoint = hn::Sub(hn::Round(hn::Mul(hn::Set(df, -min), scale)),
+                               hn::Set(df, 128.0f));
+  const VF dq_sub = hn::Mul(zeropoint, inv_scale);  // For MulSub.
+  for (size_t i = 0; i < kGroupSize; i += NF) {
+    const VF v = hn::Load(df, in + i);
+    const VF q = hn::Round(hn::MulAdd(v, scale, zeropoint));
+    hn::Store(q, df, enc + i);
+    // Dequantize.
+    const VF d = hn::MulSub(q, inv_scale, dq_sub);
+    hn::Store(d, df, dec + i);
+
+    const VF err = hn::AbsDiff(v, d);  // L1
+    vsum_err = hn::Add(vsum_err, err);
+
+    // For preventing division by zero. However, we still want to
+    // clamp snr because it could be very high (>1E3 when most
+    // elements are lossless).
+    const MF has_err = hn::Gt(err, k0);
+    const VF rel = hn::MaskedDivOr(k0, has_err, hn::Abs(v), err);
+    // SNR = 1 + abs/L1, with cap on the latter term.
+    const VF snr = hn::Add(k1, hn::Min(rel, hn::Set(df, 300.f)));
+    hn::Store(snr, df, all_snr + i);
+    // Where `has_err` is false, `snr` elements are 1 and log(1) is zero, hence
+    // they do not affect sum_log. However, very high errors also result in
+    // snr=1, which drags down the average because `sum_log` is increased.
+    num_snr += hn::CountTrue(df, has_err);
+
+    const VD log_snr0 = hn::Log(dd, hn::PromoteLowerTo(dd, snr));
+    const VD log_snr1 = hn::Log(dd, hn::PromoteUpperTo(dd, snr));
+    sum_log_snr0 = hn::Add(sum_log_snr0, log_snr0);
+    sum_log_snr1 = hn::Add(sum_log_snr1, log_snr1);
+  }
+
+  const float sum_err = hn::ReduceSum(df, vsum_err);
+  const float avg_L1 = sum_err / static_cast<float>(kGroupSize);
+  const double sum_log = hn::ReduceSum(dd, hn::Add(sum_log_snr0, sum_log_snr1));
+  // SNR >= 1, hence log >= 0.
+  HWY_ASSERT(sum_log >= 0.0);
+  if (num_snr == 0) {  // Avoid division by zero.
+    // It can happen that dequantization is lossless, i.e. SNR is
+    // infinite; skip such groups.
+    HWY_ASSERT(sum_err == 0.0f);
+    return;
+  }
+  // Signal to noise ratio (Shannon's channel capacity, NOT the
+  // L2-based and logarithmic PSNR)
+  const float snr = std::exp(sum_log / static_cast<double>(num_snr));
+
+  my_stats.NotifyGroup(avg_L1, snr);
+}
+
 // First dispatch to the type, then parallel over rows, then vectorized
 // decompress and Notify for each value.
 void UpdateStatsT(TensorStats& stats, size_t layer_idx,
@@ -138,29 +230,30 @@ void UpdateStatsT(TensorStats& stats, size_t layer_idx,
           my_stats.NotifyCond(ConditionNumber(row, cols));
 
           namespace hn = hwy::HWY_NAMESPACE;
-          hn::ScalableTag<float> df;
+          const hn::ScalableTag<float> df;
           using VF = hn::Vec<decltype(df)>;
           HWY_LANES_CONSTEXPR size_t NF = hn::Lanes(df);
-          HWY_ALIGN float buf[2 * hn::MaxLanes(df)];
+          HWY_ALIGN float buf[kGroupSize];
+          size_t buf_filled = 0;
 
           size_t packed_ofs = 0;
           if (cols >= 2 * NF) {
             for (; packed_ofs <= cols - 2 * NF; packed_ofs += 2 * NF) {
               VF v0, v1;
               Decompress2(df, packed, packed_ofs, v0, v1);
-              hn::Store(v0, df, buf);
-              hn::Store(v1, df, buf + NF);
-              const VF min_mag = hn::Min(hn::Abs(v0), hn::Abs(v1));
-              const VF max_mag = hn::Max(hn::Abs(v0), hn::Abs(v1));
-              const float min = hn::ReduceMin(df, min_mag);
-              if (min != 0.0f) {  // Avoid division by zero.
-                my_stats.NotifyGroup(min, hn::ReduceMax(df, max_mag));
-              }
+              hn::Store(v0, df, buf + buf_filled);
+              hn::Store(v1, df, buf + buf_filled + NF);
+              buf_filled += 2 * NF;
+              if (buf_filled == kGroupSize) {
+                QuantizeGroup(buf, my_stats);
 
-              for (size_t i = 0; i < 2 * NF; ++i) {
-                my_stats.Notify(buf[i], row_idx, packed_ofs + i);
+                for (size_t i = 0; i < kGroupSize; ++i) {
+                  my_stats.Notify(buf[i], row_idx, packed_ofs + i);
+                }
+                my_stats.NotifyCorr(Correlation(buf, kGroupSize));
+
+                buf_filled = 0;
               }
-              my_stats.NotifyCorr(Correlation(buf, 2 * NF));
             }
           }
 
@@ -168,7 +261,7 @@ void UpdateStatsT(TensorStats& stats, size_t layer_idx,
           for (; packed_ofs < cols; packed_ofs += NF) {
             const size_t remaining = HWY_MIN(NF, cols - packed_ofs);
             DecompressAndZeroPad(df, packed, packed_ofs, buf, remaining);
-            // Skip NotifyGroup for this partial group.
+            // Skip QuantizeGroup because it requires full groups.
             for (size_t i = 0; i < remaining; ++i) {
               my_stats.Notify(buf[i], row_idx, packed_ofs + i);
             }

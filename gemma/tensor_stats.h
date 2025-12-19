@@ -68,7 +68,12 @@ struct TensorStatsAcrossLayers {
       fprintf(stderr, "cor.avg %s\n", s_corr_avg.ToString(skip).c_str());
     }
     fprintf(stderr, "cor.max %s\n", s_corr_max.ToString(skip).c_str());
-    fprintf(stderr, "rng_avg %s\n", s_range_avg.ToString(skip).c_str());
+    fprintf(stderr, "err_avg %s\n", s_grp_err_avg.ToString(skip).c_str());
+    fprintf(stderr, "err_std %s\n", s_grp_err_std.ToString(skip).c_str());
+    fprintf(stderr, "err_max %s\n", s_grp_err_max.ToString(skip).c_str());
+    fprintf(stderr, "snr_1   %s\n", s_grp_snr1.ToString(skip).c_str());
+    fprintf(stderr, "snr_avg %s\n", s_grp_snr_avg.ToString(skip).c_str());
+    fprintf(stderr, "snr_std %s\n", s_grp_snr_std.ToString(skip).c_str());
     fprintf(stderr, "exp.min %s\n", s_exp_min.ToString(skip).c_str());
     fprintf(stderr, "exp.max %s\n", s_exp_max.ToString(skip).c_str());
     fprintf(stderr, "exp.mod %s\n", s_exp_mode.ToString(skip).c_str());
@@ -112,7 +117,12 @@ struct TensorStatsAcrossLayers {
   hwy::Stats s_corr_avg;
   hwy::Stats s_corr_max;
 
-  hwy::Stats s_range_avg;
+  hwy::Stats s_grp_err_avg;
+  hwy::Stats s_grp_err_std;
+  hwy::Stats s_grp_err_max;
+  hwy::Stats s_grp_snr1;
+  hwy::Stats s_grp_snr_avg;
+  hwy::Stats s_grp_snr_std;
 
   hwy::Stats s_exp_min;
   hwy::Stats s_exp_max;
@@ -151,13 +161,11 @@ class TensorStatsAccumulator {
   void DoNotPrint() { skip_.fetch_or(1); }
   bool ShouldPrint() const { return skip_.load() == 0; }
 
-  // Vector code computed the min/max of a group (= two vectors); this is
-  // faster than doing it in `Notify`.
-  void NotifyGroup(float min, float max) {
-    s_group_min_.Notify(min);
-    s_group_max_.Notify(max);
-    // Caller ensures min != 0.
-    s_group_range_.Notify(max / min);
+  // Computed by vector code, much faster than doing it in `Notify`.
+  void NotifyGroup(float avg_L1, float snr) {
+    s_group_err_.Notify(avg_L1);
+    s_group_snr_.Notify(snr);
+    num_snr1_ += (snr == 1.0f);
   }
 
   void NotifyCorr(float corr) { s_corr_.Notify(corr); }
@@ -173,9 +181,9 @@ class TensorStatsAccumulator {
     s_val_.Assimilate(other.s_val_);
     s_mag_.Assimilate(other.s_mag_);
     s_corr_.Assimilate(other.s_corr_);
-    s_group_min_.Assimilate(other.s_group_min_);
-    s_group_max_.Assimilate(other.s_group_max_);
-    s_group_range_.Assimilate(other.s_group_range_);
+    s_group_err_.Assimilate(other.s_group_err_);
+    s_group_snr_.Assimilate(other.s_group_snr_);
+    num_snr1_ += other.num_snr1_;
   }
 
   // Called on the per-layer representative after reducing across threads.
@@ -197,7 +205,12 @@ class TensorStatsAccumulator {
     s.s_corr_avg.Notify(s_corr_.Mean());
     s.s_corr_max.Notify(s_corr_.Max());
 
-    s.s_range_avg.Notify(s_group_range_.Mean());
+    s.s_grp_err_avg.Notify(s_group_err_.Mean());
+    s.s_grp_err_std.Notify(s_group_err_.StandardDeviation());
+    s.s_grp_err_max.Notify(s_group_err_.Max());
+    s.s_grp_snr1.Notify(static_cast<float>(num_snr1_));
+    s.s_grp_snr_avg.Notify(s_group_snr_.Mean());
+    s.s_grp_snr_std.Notify(s_group_snr_.StandardDeviation());
 
     const uint32_t subnormals = b_exp256_.Bin(0);
     // Prevent subnormals from hiding the min exponent.
@@ -222,13 +235,12 @@ class TensorStatsAccumulator {
   void PrintAll() {
     fprintf(stderr, "Frob %.2E\n", std::sqrt(sum_sq_));
     const int skip = hwy::Stats::kNoGeomean;
-    fprintf(stderr, "cnd  %s\n", s_cond_.ToString(skip).c_str());
-    fprintf(stderr, "val  %s\n", s_val_.ToString(skip).c_str());
-    fprintf(stderr, "mag  %s\n", s_mag_.ToString(skip).c_str());
-    fprintf(stderr, "corr %s\n", s_corr_.ToString(skip).c_str());
-    fprintf(stderr, "group_min   %s\n", s_group_min_.ToString(skip).c_str());
-    fprintf(stderr, "group_max   %s\n", s_group_max_.ToString(skip).c_str());
-    fprintf(stderr, "group_range %s\n", s_group_range_.ToString(skip).c_str());
+    fprintf(stderr, "cnd %s\n", s_cond_.ToString(skip).c_str());
+    fprintf(stderr, "val %s\n", s_val_.ToString(skip).c_str());
+    fprintf(stderr, "mag %s\n", s_mag_.ToString(skip).c_str());
+    fprintf(stderr, "crr %s\n", s_corr_.ToString(skip).c_str());
+    fprintf(stderr, "err %s\n", s_group_err_.ToString(skip).c_str());
+    fprintf(stderr, "snr %s\n", s_group_snr_.ToString(skip).c_str());
     b_exp256_.Print("exp");
     PrintBinRanges(b_big_row_, "big row");
     PrintBinRanges(b_big_col_, "big col");
@@ -244,30 +256,25 @@ class TensorStatsAccumulator {
     }
     if (total == 0) return;
 
-    // If all bins are at least 10% of a uniform distribution, print the range
-    // to vastly reduce the log size.
+    fprintf(stderr, "%s total %zu: \n", name, total);
+    // Group together runs to reduce the log size.
     const size_t min = HWY_MAX(1, total / (N * 10));
-    size_t last = 0;
-    for (; last < N; ++last) {
-      if (b.Bin(last) < min) break;
-    }
-    if (last >= N / 2) {
-      // Also require all subsequent bins to be zero, otherwise we should
-      // print the outlier bins.
-      bool all_zero = true;
-      for (size_t i = last + 1; i < N; ++i) {
-        if (b.Bin(last) != 0) {
-          all_zero = false;
-          break;
-        }
+    for (size_t i = 0; i < N; ++i) {
+      if (b.Bin(i) == 0) continue;
+      if (b.Bin(i) < min) {
+        fprintf(stderr, " %3zu: %zu\n", i, b.Bin(i));
+        continue;
       }
-      if (all_zero) {
-        fprintf(stderr, "%s: uniform up to %zu\n", name, last);
-        return;
+      const size_t first = i;
+      while (i + 1 < N && b.Bin(i + 1) >= min) {
+        i++;
+      }
+      if (first == i) {
+        fprintf(stderr, " %3zu: %zu\n", i, b.Bin(i));
+      } else {
+        fprintf(stderr, " [%3zu, %3zu]\n", first, i);
       }
     }
-
-    b.Print(name, /*skip_zero=*/true);
   }
 
   double sum_sq_ = 0.0;      // for Frobenius norm
@@ -278,9 +285,9 @@ class TensorStatsAccumulator {
   hwy::Stats s_mag_;
   hwy::Stats s_cond_;  // condition number
   hwy::Stats s_corr_;  // lag-1 autocorrelation
-  hwy::Stats s_group_min_;
-  hwy::Stats s_group_max_;
-  hwy::Stats s_group_range_;
+  hwy::Stats s_group_err_;
+  hwy::Stats s_group_snr_;
+  size_t num_snr1_ = 0;
   std::atomic<int> skip_{0};
 };
 

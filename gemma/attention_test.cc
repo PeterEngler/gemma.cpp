@@ -1,8 +1,10 @@
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>  // strcmp
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -105,7 +107,8 @@ struct TestAttentionState {
         tokens(num_tokens),
         attention_storage_(model_state.config, model_state.layer_config,
                            batch_size, num_tokens, runtime_config,
-                           state.ctx.allocator, row_ptrs_),
+                           state.ctx.pools.MaxWorkers(), state.ctx.allocator,
+                           row_ptrs_),
         attention(model_state.config, num_tokens, attention_storage_) {
     for (size_t i = 0; i < qbatch_size; ++i) {
       kv_caches.emplace_back(model_state.config, inference_args,
@@ -143,6 +146,7 @@ struct TestAttentionState {
 };
 
 double GetTolerance() {
+  if (IsBF16<KV_t>()) return 1e-2;
   const char* target_name = hwy::TargetName(HWY_TARGET);
   if (strncmp(target_name, "AVX2", 4) == 0) {
     return 2e-2;
@@ -152,6 +156,57 @@ double GetTolerance() {
     return 5e-3;
   } else {
     return 1e-7;
+  }
+}
+
+// Comparison function for computations that used BF16, whether the result is
+// stored in BF16 or F32.
+// Compare with absolute tolerance for values with small magnitudes.
+// Compare with relative tolerance for values with larger magnitudes.
+template <typename T>
+bool CompareArraySimilarBF16(const T* expected, const T* actual, size_t count,
+                             const char* target_name, const char* filename,
+                             int line) {
+  constexpr double kTolerance = 3e-2;
+  for (size_t i = 0; i < count; ++i) {
+    const double exp = hwy::ConvertScalarTo<double>(expected[i]);
+    const double act = hwy::ConvertScalarTo<double>(actual[i]);
+    const double l1 = std::abs(act - exp);
+    // Cannot divide, so check absolute error.
+    if (std::abs(exp) <= 1.0) {
+      if (l1 > kTolerance) {
+        std::string array_values = hwy::detail::FormatMismatchedArrays(
+            expected, actual, count, kTolerance);
+        HWY_WARN("%s %s:%d %s mismatch %zu of %zu: %E %E l1 %E tol %E%s\n",
+                 target_name, filename, line, "BF16", i, count, exp, act, l1,
+                 kTolerance, array_values.c_str());
+        return false;
+      }
+    } else {  // relative
+      const double rel = l1 / exp;
+      if (rel > kTolerance) {
+        std::string array_values = hwy::detail::FormatMismatchedArrays(
+            expected, actual, count, kTolerance);
+        HWY_WARN("%s %s:%d %s mismatch %zu of %zu: %E %E rel %E tol %E%s\n",
+                 target_name, filename, line, "BF16", i, count, exp, act, rel,
+                 kTolerance, array_values.c_str());
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+template <typename T>
+bool CompareArraySimilar(const T* expected, const T* actual, size_t count,
+                         const char* target_name, const char* filename,
+                         int line) {
+  if constexpr (IsBF16<KV_t>()) {
+    return CompareArraySimilarBF16(expected, actual, count, target_name,
+                                   filename, line);
+  } else {
+    return hwy::CompareArraySimilar(expected, actual, count, GetTolerance(),
+                                    target_name, filename, line);
   }
 }
 
@@ -170,9 +225,9 @@ void CompareAttSumsWithGolden(
       for (size_t j = 0; j < kDims; ++j) {
         actual_row[j] = hwy::F32FromBF16(attention.att_sums.Row(i)[j]);
       }
-      EXPECT_TRUE(hwy::CompareArraySimilar(
-          golden[token_idx][qi], actual_row.get(), kDims, GetTolerance(),
-          hwy::TargetName(HWY_TARGET), __FILE__, __LINE__))
+      EXPECT_TRUE(CompareArraySimilar(golden[token_idx][qi], actual_row.get(),
+                                      kDims, hwy::TargetName(HWY_TARGET),
+                                      __FILE__, __LINE__))
           << "att_sums mismatch for token_idx=" << token_idx << " qi=" << qi;
     }
   }
@@ -200,19 +255,20 @@ void CompareKVCacheWithGolden(
 
   for (size_t token_idx = 0; token_idx < kNumTokens; ++token_idx) {
     for (size_t qi = 0; qi < kQBatchSize; ++qi) {
-      const float* cache_row =
+      const BF16* cache_row =
           kv_caches[qi].kv_cache.Row(start_offset + token_idx);
       for (size_t j = 0; j < kDims; ++j) {
-        actual_k_row[j] = cache_row[kv_offset + j];
-        actual_v_row[j] = cache_row[kv_offset + qkv_dim + j];
+        actual_k_row[j] = hwy::ConvertScalarTo<float>(cache_row[kv_offset + j]);
+        actual_v_row[j] =
+            hwy::ConvertScalarTo<float>(cache_row[kv_offset + qkv_dim + j]);
       }
-      EXPECT_TRUE(hwy::CompareArraySimilar(
-          k_golden[token_idx][qi], actual_k_row.get(), kDims, GetTolerance(),
+      EXPECT_TRUE(CompareArraySimilar(
+          k_golden[token_idx][qi], actual_k_row.get(), kDims,
           hwy::TargetName(HWY_TARGET), __FILE__, __LINE__))
           << "K cache mismatch for token_idx=" << token_idx << " qi=" << qi
           << " kv_head=" << kv_head;
-      EXPECT_TRUE(hwy::CompareArraySimilar(
-          v_golden[token_idx][qi], actual_v_row.get(), kDims, GetTolerance(),
+      EXPECT_TRUE(CompareArraySimilar(
+          v_golden[token_idx][qi], actual_v_row.get(), kDims,
           hwy::TargetName(HWY_TARGET), __FILE__, __LINE__))
           << "V cache mismatch for token_idx=" << token_idx << " qi=" << qi
           << " kv_head=" << kv_head;
@@ -238,8 +294,8 @@ void CompareQVecsWithGolden(
       for (size_t j = 0; j < kDims; ++j) {
         actual_q_row[j] = q_row[head_offset + j];
       }
-      EXPECT_TRUE(hwy::CompareArraySimilar(
-          q_golden[token_idx][qi], actual_q_row.get(), kDims, GetTolerance(),
+      EXPECT_TRUE(CompareArraySimilar(
+          q_golden[token_idx][qi], actual_q_row.get(), kDims,
           hwy::TargetName(HWY_TARGET), __FILE__, __LINE__))
           << "Q vec mismatch for token_idx=" << token_idx << " qi=" << qi
           << " q_head=" << q_head;
@@ -267,42 +323,42 @@ const float kGoldenAttSums[kNumTokens][kQBatchSize][kDimsToCompare] = {
       26.875, 63, 3.34375, -67.5, 31.125, -190, 125},
      {-30.375, -17.875, 51.75, -78, -84, 6.40625, 15.375, 70, -22.875, 20.125,
       -14.9375, -109.5, 76, 9.25, -142, 29.5, -105}},
-    {{-32.75, 38.25, 78.5, 107.5, 20.25, 197, -136, 42.5, -84, 25.625, 4.96875,
+    {{-32.75, 38.25, 78.5, 107.5, 20.25, 197, -136, 42.5, -84, 25.625, 5.35875,
       128, 27.25, -161, 19.125, -58, 97.5},
      {-18.5, -18, 135, -13.4375, -6.625, -45.75, 29.625, 93, 18.625, 75.5,
       102.5, -184, 52.75, 83.5, -71, 46.5, -52}},
-    {{-16.375, -61.5, -58.25, -27.375, -28, 71, -109.5, 60.25, 3.125, -29.125,
-      6.90625, 150, 144, -155, -47.25, -98.5, 3.5625},
-     {-19, -16.75, 129, 0.59765625, -82, 123.5, 60.75, -36.75, -77, 26.625, 51,
-      -66.5, -0.84765625, -46.5, -152, -2.9375, -81}},
-    {{3.984375, 83, -41.75, 39.5, -203, 110, -76, 131, 0.4609375, -44.5, -63.75,
+    {{-16.375, -61.5, -58.25, -27.375, -28, 71, -109.5, 60.25, 3.625, -29.125,
+      6.4625, 150, 144, -155, -47.25, -98.5, 3.5625},
+     {-19, -16.75, 129, 0.628925, -82, 123.5, 60.75, -36.75, -77, 26.625, 51,
+      -66.5, -0.62165625, -46.5, -152, -2.9375, -81}},
+    {{3.684375, 83, -41.75, 39.5, -203, 110, -76, 131, 1.0069375, -44.5, -63.75,
       -46, -22, -19.375, -16.125, -148, 20.875},
-     {-47, -19.5, 58, 81.5, 21.75, -30, -118, 44.25, -149, 22.5, 188, -66.5, 33,
+     {-47, -19.5, 58, 81.5, 23.35, -30, -118, 44.25, -149, 22.5, 188, -66.5, 33,
       10.9375, -52.5, 23.25, 75}},
-    {{64, -31, -89, -92.5, -11.1875, -54.75, -302, 3.453125, -108, 39.25,
+    {{64, -31, -89, -92.5, -11.1875, -54.75, -302, 4.213125, -108, 39.25,
       -34.75, 18, -52, 100, -186, -75.5, 50.75},
-     {7.6875, -80, -40, 32.25, -30.25, 90, -41, 44.25, -140, -2.4375, 82.5,
+     {7.1875, -80, -40, 32.25, -30.25, 90, -41, 44.25, -140, -2.4375, 82.5,
       39.25, 65, 47.25, -89.5, -34.25, 137}},
     {{39.75, 17.875, 115, 38.75, -44, 139, -53.25, -23.875, -13.0625, 38.5,
-      32.5, 53.75, 109, 4.09375, 57.5, -20.5, 132},
-     {143, 249, 5.09375, 0.83984375, 27.875, -5.84375, 30.25, -101.5, 65.5,
-      13.5, 195, -10.0625, 97.5, 2.203125, -97.5, -100, -19.25}},
+      32.5, 53.75, 109, 4.62375, 57.5, -20.5, 132},
+     {143, 249, 4.9375, 1.33984375, 27.875, -5.84375, 30.25, -101.5, 65.5, 13.5,
+      195, -10.0625, 97.5, 1.903125, -97.5, -100, -19.25}},
     {{-30.125, -169, -150, 58, -35.75, 22.75, 36.5, -32.25, -8.9375, 55.25,
       -117, 26.375, 39.5, 125, 66, 48.75, 20.75},
-     {137, 5.25, 61.25, 37, -42.75, 240, 62, -164, 11.3125, 173, 174, 23.5,
+     {137, 3.85, 61.25, 37, -42.75, 240, 62, -164, 10.3125, 173, 174, 23.5,
       88.5, 48.5, -46.25, -36.75, 101.5}},
-    {{-103, -47.5, 39, -48, -67.5, 121, -136, 99, 80, -47.5, 107.5, 48.75, 97.5,
+    {{-103, -47.5, 39, -48, -67.5, 121, -136, 99, 80, -47.5, 107.5, 43.75, 97.5,
       125, -53.5, -14.625, 262},
-     {29.875, 7.34375, -36.75, -14.5, -27.5, 44.75, -67.5, -40.75, 71.5, 172,
+     {28.075, 6.64375, -36.75, -14.5, -27.5, 44.75, -67.5, -40.75, 71.5, 172,
       81, -27.25, -3.03125, 111, -167, 59, 176}},
     {{-37.25, 109.5, -26.125, -115.5, 108, 57.25, 1.3671875, 72, -122.5, 59.25,
       -52, -12.625, 43.25, 16.25, -41.75, 26.5, 70.5},
-     {40.25, 53.25, -142, 78.5, 38, 4.3125, -27.75, -134, -85, 107.5, 2.5, 93.5,
+     {40.25, 53.25, -142, 78.5, 38, 4.625, -27.75, -134, -85, 107.5, 2.5, 93.5,
       58.25, 173, -53.5, 25.125, 4.8125}},
     {{-8.4375, -35, -35.5, 131, -33.25, 106, 109.5, -92, -135, 80, 21.5,
       -17.125, 15.25, 143, -27, 103, 101},
      {-77, 40.75, -10.125, 33.25, -33, 104, -7.6875, 85.5, -40, 93, 61, 14.5625,
-      8.125, -99.5, 13.6875, -11.6875, 33}},
+      8.55, -99.5, 14.6875, -11.6875, 33}},
 };
 
 // Layer 0, *K*V Head 0

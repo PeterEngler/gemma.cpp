@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "gemma/configs.h"     // ModelConfig
+#include "gemma/flash_structs.h"
 #include "gemma/gemma_args.h"  // AttentionImpl
 #include "gemma/kv_cache.h"
 #include "gemma/tensor_stats.h"
@@ -52,10 +53,13 @@ struct AttentionActivations {
   AttentionActivations(
       const ModelConfig& config, const LayerConfig& layer_config,
       size_t batch_size, size_t seq_len, const RuntimeConfig& runtime_config,
-      const Allocator& allocator,
+      size_t max_workers, const Allocator& allocator,
       std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>>& row_ptrs)
-      :  // `vocab_size == 0` means it is for Vit part, VitAttention is still
-         // MHA and does not use an external KV cache.
+      : rep_factor(max_workers *
+                   AttentionActivations::kThreadReplicationFactor /
+                   layer_config.heads),
+        // `vocab_size == 0` means it is for Vit part, VitAttention
+        // is still MHA and does not use an external KV cache.
         q(MatFactory("q", batch_size,
                      config.vocab_size == 0
                          ? layer_config.heads * 3 * layer_config.qkv_dim
@@ -86,6 +90,9 @@ struct AttentionActivations {
         att_out(MatFactory("att_out", batch_size,
                            layer_config.heads * layer_config.qkv_dim,
                            allocator)),
+        att_out_reps(MatFactory("att_out", batch_size * rep_factor,
+                                layer_config.heads * layer_config.qkv_dim,
+                                allocator)),
         softmax_max(MatFactory("softmax_max", batch_size, layer_config.heads,
                                allocator)),
         softmax_d(
@@ -107,6 +114,11 @@ struct AttentionActivations {
       }
       return;
     }
+    // This is a guess at the maximum number of params we might need to avoid
+    // reallocations. The actual number of params is determined by the number of
+    // query tiles, which is not known here.
+    flash_params.reserve(batch_size * layer_config.heads);
+    split_flash_params.reserve(batch_size * layer_config.heads);
 
     // For MatMul outputs, precompute their row pointers.
     // If we forget any MatMul outputs here, debug builds print a warning but
@@ -130,6 +142,7 @@ struct AttentionActivations {
     pre_att_rms_out.OverrideRows(batch_size);
     att.OverrideRows(batch_size);
     att_out.OverrideRows(batch_size);
+    att_out_reps.OverrideRows(batch_size * rep_factor);
     softmax_max.OverrideRows(batch_size);
     softmax_d.OverrideRows(batch_size);
     att_sums.OverrideRows(batch_size);
@@ -137,6 +150,15 @@ struct AttentionActivations {
     // `inv_timescale*` are not batched.
   }
 
+  // Maximum factor by which we might scale-up work to maximize parallelism.
+  size_t rep_factor = 1;
+  // Parameters for flash attention. The size of the vector is somewhere between
+  // the number of query rows and 1/8th of that.
+  std::vector<FlashAttentionParams> flash_params;
+  // Parameters for flash attention, split by k-position. May be significantly
+  // larger than flash_params in decode mode, when the number of query rows is
+  // small.
+  std::vector<FlashAttentionParams> split_flash_params;
   MatStorageT<float> q;  // query
   MatStorageT<BF16> q_bf;
   MatStorageT<BF16> q_T;  // Transposed to maximize attention speed.
@@ -148,6 +170,7 @@ struct AttentionActivations {
   MatStorageT<float> pre_att_rms_out;
   MatStorageT<float> att;          // attention vector
   MatStorageT<float> att_out;      // attention output
+  MatStorageT<float> att_out_reps;  // attention output for each thread.
   MatStorageT<float> softmax_max;  // see OnlineSoftmaxState
   MatStorageT<float> softmax_d;    // see OnlineSoftmaxState
   // Accumulation of attention outputs over heads
@@ -156,19 +179,27 @@ struct AttentionActivations {
   // Rope
   MatStorageT<float> inv_timescale;
   MatStorageT<float> inv_timescale_global;
+  // Replication factor to help evenly share work over threads.
+  static constexpr size_t kThreadReplicationFactor = 4;
 };
 
 // A non-owning view of AttentionActivations.
 struct AttentionActivationsPtrs {
-  AttentionActivationsPtrs(const ModelConfig& config, size_t seq_len)
+  AttentionActivationsPtrs(
+      const ModelConfig& config, size_t seq_len,
+      std::vector<FlashAttentionParams>& flash_params,
+      std::vector<FlashAttentionParams>& split_flash_params)
       : config(config),
+        flash_params(flash_params),
+        split_flash_params(split_flash_params),
         div_seq_len(static_cast<uint32_t>(seq_len)),
         div_heads(static_cast<uint32_t>(config.layer_configs[0].heads)),
         query_scale(ChooseQueryScale(config)) {}
 
   AttentionActivationsPtrs(const ModelConfig& config, size_t seq_len,
-                           const AttentionActivations& activations)
-      : AttentionActivationsPtrs(config, seq_len) {
+                           AttentionActivations& activations)
+      : AttentionActivationsPtrs(config, seq_len, activations.flash_params,
+                                 activations.split_flash_params) {
     q = activations.q;
     q_bf = activations.q_bf;
     q_T = activations.q_T;
@@ -178,6 +209,7 @@ struct AttentionActivationsPtrs {
     pre_att_rms_out = activations.pre_att_rms_out;
     att = activations.att;
     att_out = activations.att_out;
+    att_out_reps = activations.att_out_reps;
     softmax_max = activations.softmax_max;
     softmax_d = activations.softmax_d;
     att_sums = activations.att_sums;
@@ -208,6 +240,9 @@ struct AttentionActivationsPtrs {
   }
 
   const ModelConfig& config;
+  // Parameters for flash attention.
+  std::vector<FlashAttentionParams>& flash_params;
+  std::vector<FlashAttentionParams>& split_flash_params;
 
   // For the matrices below, the batch_size dimension is really qbatch.Size() *
   // token_batch_size, but in all known uses, one of those is 1.  Specifically,
@@ -233,6 +268,7 @@ struct AttentionActivationsPtrs {
   // Attention output computed from att * V, size batch_size x (q_heads *
   // qkv_dim).
   MatPtrT<float> att_out;
+  MatPtrT<float> att_out_reps;
   // The maximum logit value encountered when computing att_out from att,
   // size batch_size x q_heads . See OnlineSoftmaxState for details.
   // WARNING: Only filled in for AttentionImpl::kOld.
@@ -287,7 +323,8 @@ struct Activations {
         s_w_linear_w(config.num_layers, max_workers),
         attention_impl(runtime_config.attention_impl),
         attention_storage(config, layer_config, batch_size, seq_len,
-                          runtime_config, ctx.allocator, row_ptrs),
+                          runtime_config, ctx.pools.MaxWorkers(), ctx.allocator,
+                          row_ptrs),
         attention(config, seq_len, attention_storage) {
     HWY_ASSERT(batch_size != 0);
 

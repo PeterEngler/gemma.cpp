@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -57,43 +58,7 @@ HWY_BEFORE_NAMESPACE();
 namespace gcpp {
 namespace HWY_NAMESPACE {
 
-static constexpr size_t kNFx8HTileSize = 8;
 static constexpr float kNegInf = -std::numeric_limits<float>::max() / 64.0f;
-// Transposes q into q_t.
-// Both are 4D tensors stuffed into a 2-D MatPtrT.
-// q has shape [batch, qbatch][head, qkv_dim].
-// q_t has shape [qkv_dim][qbatch, head, batch] in order to make the maximum
-// possible consecutive elements have the same KV.
-static void TransposeQ(const MatPtrT<float>& q, MatPtrT<BF16>& q_t,
-                       const size_t qbatch_size, ThreadingContext& ctx) {
-  // Group floats by the number of floats in a cache line.
-  const size_t kNF = ctx.cache_info.LineBytes() / sizeof(float);
-  const size_t num_heads = q.Cols() / q_t.Rows();
-  const size_t batch_size = q.Rows() / qbatch_size;
-  const auto func = [&](const size_t task, size_t worker) HWY_ATTR {
-    GCPP_ZONE(ctx, worker, Zones::kFlashAttentionTransposeQ);
-    for (size_t lane = 0; lane < kNF; ++lane) {
-      size_t q_row = task * kNF + lane;
-      if (q_row >= q_t.Rows()) break;
-      BF16* HWY_RESTRICT qt_row = q_t.Row(q_row);
-      for (size_t qi = 0; qi < qbatch_size; ++qi) {
-        for (size_t h = 0; h < num_heads; ++h) {
-          for (size_t b = 0; b < batch_size; ++b) {
-            qt_row[(qi * num_heads + h) * batch_size + b] =
-                hwy::ConvertScalarTo<BF16>(
-                    q.Row(b * qbatch_size + qi)[h * q_t.Rows() + q_row]);
-          }
-        }
-      }
-    }
-  };
-  {
-    const size_t num_tasks = hwy::DivCeil(q_t.Rows(), kNF);
-    // Better than kFlat.
-    ParallelFor(Parallelism::kHierarchical, num_tasks, ctx,
-                /*cluster_idx=*/0, Callers::kFlashTransposeQ, func);
-  }
-}
 
 // Updates q in place for RMSNorm and positional encoding.
 void RMSNormAndPositionalEncoding(const size_t num_tokens, const QBatch& qbatch,
@@ -136,292 +101,390 @@ void RMSNormAndPositionalEncoding(const size_t num_tokens, const QBatch& qbatch,
   }
 }
 
-// Handles a single v row of flash attention for a single q.k dot product.
-HWY_INLINE void SingleFlashAttentionStep(float x, float cap, float& old_max,
-                                         float& old_d,
-                                         const float* HWY_RESTRICT v,
-                                         const size_t v_cols,
-                                         float* HWY_RESTRICT att_out) {
-  if (cap > 0.0f) {
-    // Compute tanh(x / cap) * cap, being LogitsSoftCap on the scalar x.
-    x = cap * std::tanh(x / cap);
-  }
-  float m = std::max(x, old_max);
-  x = std::exp(x - m);
-  float scale = old_d * std::exp(old_max - m);
-  old_d = x + scale;
-  old_max = m;
-  float one_over_d = 1.0f / old_d;
-  scale *= one_over_d;
-  x *= one_over_d;
-  MulByConst(scale, att_out, v_cols);
-  MulByConstAndAdd(x, v, att_out, v_cols);
-}
-
-// Calculates the complete attention outputs for a single row of q.
-void SingleFlashAttention(const size_t start_pos, const size_t last_pos,
-                          const BF16* HWY_RESTRICT q, const MatPtrT<KV_t>& k,
-                          const MatPtrT<KV_t>& v, const size_t layer_idx,
-                          const AttentionActivationsPtrs& activations,
-                          float* HWY_RESTRICT att_out, ThreadingContext& ctx,
-                          const size_t worker) {
-  GCPP_ZONE(ctx, worker, Zones::kFlashAttentionSingleFlashAttention);
-  const hn::ScalableTag<BF16> dbf;
-  const size_t qkv_dim = k.Cols();
-
-  const size_t pos_mod = activations.div_seq_len.Remainder(start_pos);
-  // TODO: Mixed-mode can be further improved for Turin: we can demote right
-  // before we do the dot product instruction, rather than promote both to f32.
-  // But some potential accuracy loss there, needs evaluation first.
-  float m = Dot(dbf, MakeConstSpan(q, qkv_dim), 0, k.Row(pos_mod), qkv_dim);
-  if (float cap = activations.config.att_cap; cap > 0.0f) {
-    // Compute tanh(x / cap) * cap, being LogitsSoftCap on the scalar x.
-    m = cap * std::tanh(m / cap);
-  }
-  float d = 1.0f;
-  // This is just a copy of the first token.
-  MulByConstTo(d, v.Row(pos_mod), att_out, v.Cols(), ctx, worker);
-  for (size_t pos = start_pos + 1; pos <= last_pos; ++pos) {
-    const size_t pos_mod = activations.div_seq_len.Remainder(pos);
-    float x = Dot(dbf, MakeConstSpan(q, qkv_dim), 0, k.Row(pos_mod), qkv_dim);
-    SingleFlashAttentionStep(x, activations.config.att_cap, m, d,
-                             v.Row(pos_mod), v.Cols(), att_out);
-  }
-}
-
-// Computes and returns a single vector of NF Q.K dot products, which represents
-// the dot products of NF rows of Q for a single K timestep.
-template <class DF, class VF = hn::Vec<DF>>
-VF QDotKVector(DF df, const uint32_t* HWY_RESTRICT q_offsets,
-               const size_t k_pos, const MatPtrT<BF16>& q,
-               const MatPtrT<KV_t>& k) {
-  const hn::ScalableTag<BF16> dbf;
-  const size_t qkv_dim = k.Cols();
-
-  hn::TFromD<DF> results[hn::MaxLanes(df)];
-  for (size_t i = 0; i < hn::Lanes(df); ++i) {
-    results[i] = Dot(dbf, MakeConstSpan(q.Row(0) + q_offsets[i], qkv_dim), 0,
-                     k.Row(k_pos), qkv_dim);
-  }
-  return hn::LoadU(df, results);
-}
-
-// Returns an NF Q rows by 8 K rows tile of Q.K dot products.
-// This is the result of NF rows of Q against 8 K timesteps, with positions
-// given by k_pos[0..7]. Q has been transposed so that the NF rows are read in
-// consecutive elements, and other columns by adding q_stride.
-template <class DF, class VF = hn::Vec<DF>>
-void QDotKTile(DF df, const BF16* HWY_RESTRICT q, const size_t q_stride,
-               const MatPtrT<KV_t>& k, const size_t* k_pos, VF& sum0, VF& sum1,
-               VF& sum2, VF& sum3, VF& sum4, VF& sum5, VF& sum6, VF& sum7) {
-  constexpr size_t kHTileSize = kNFx8HTileSize;
+// Zeroes out kVTileSize of the given vectors.
+template <size_t kVTileSize, class DF, class VF = hn::Vec<DF>>
+HWY_INLINE void ZeroResults(DF df, VF& sum0, VF& HWY_MAYBE_UNUSED sum1,
+                            VF& HWY_MAYBE_UNUSED sum2,
+                            VF& HWY_MAYBE_UNUSED sum3,
+                            VF& HWY_MAYBE_UNUSED sum4,
+                            VF& HWY_MAYBE_UNUSED sum5,
+                            VF& HWY_MAYBE_UNUSED sum6,
+                            VF& HWY_MAYBE_UNUSED sum7) {
   sum0 = hn::Zero(df);
-  sum1 = hn::Zero(df);
-  sum2 = hn::Zero(df);
-  sum3 = hn::Zero(df);
-  sum4 = hn::Zero(df);
-  sum5 = hn::Zero(df);
-  sum6 = hn::Zero(df);
-  sum7 = hn::Zero(df);
-  const float* HWY_RESTRICT k_row[kHTileSize];
-  for (size_t i = 0; i < kHTileSize; ++i) {
-    k_row[i] = k.Row(k_pos[i]);
+  if constexpr (kVTileSize >= 4) {
+    sum1 = hn::Zero(df);
+    sum2 = hn::Zero(df);
+    sum3 = hn::Zero(df);
   }
-
-  const hn::Rebind<BF16, DF> dbfh;
-  using VBF = hn::Vec<decltype(dbfh)>;
-
-  for (size_t i = 0; i < k.Cols(); ++i) {
-    const VBF q_vec_bf = hn::Load(dbfh, q);
-    const VF q_vec = hn::PromoteTo(df, q_vec_bf);
-    VF k_0 = hn::Set(df, k_row[0][i]);
-    sum0 = hn::MulAdd(q_vec, k_0, sum0);
-    VF k_1 = hn::Set(df, k_row[1][i]);
-    sum1 = hn::MulAdd(q_vec, k_1, sum1);
-    VF k_2 = hn::Set(df, k_row[2][i]);
-    sum2 = hn::MulAdd(q_vec, k_2, sum2);
-    VF k_3 = hn::Set(df, k_row[3][i]);
-    sum3 = hn::MulAdd(q_vec, k_3, sum3);
-    VF k_4 = hn::Set(df, k_row[4][i]);
-    sum4 = hn::MulAdd(q_vec, k_4, sum4);
-    VF k_5 = hn::Set(df, k_row[5][i]);
-    sum5 = hn::MulAdd(q_vec, k_5, sum5);
-    VF k_6 = hn::Set(df, k_row[6][i]);
-    sum6 = hn::MulAdd(q_vec, k_6, sum6);
-    VF k_7 = hn::Set(df, k_row[7][i]);
-    sum7 = hn::MulAdd(q_vec, k_7, sum7);
-    q += q_stride;
+  if constexpr (kVTileSize >= 8) {
+    sum4 = hn::Zero(df);
+    sum5 = hn::Zero(df);
+    sum6 = hn::Zero(df);
+    sum7 = hn::Zero(df);
   }
 }
 
-// Returns the element-wise maximum of 8 vectors, in a single vector.
-template <class DF, class VF = hn::Vec<DF>>
-VF HWY_INLINE ElementwiseMaxOf8(DF df, const VF& x0, const VF& x1, const VF& x2,
-                                const VF& x3, const VF& x4, const VF& x5,
-                                const VF& x6, const VF& x7) {
-  VF m0 = hn::Max(x0, x1);
-  VF m1 = hn::Max(x2, x3);
-  VF m2 = hn::Max(x4, x5);
-  VF m3 = hn::Max(x6, x7);
-  m0 = hn::Max(m0, m1);
-  m2 = hn::Max(m2, m3);
-  return hn::Max(m0, m2);
+// Returns a tile of 1, 4 or 8 Q rows by 2NF K Q.K dot products, in float32.
+// K is always pre-transposed to shape:
+// [seq_len / 2kNF, layers * kv_heads * qkv_dim/2 * 2kNF * 2], where the /2, *2
+// represents that pairs of qkv_dim elements are kept together to make best use
+// of BF16 dot product instructions.
+// Note that this version assumes that Q is float32, and not transposed, and
+// HWY_NATIVE_DOT_BF16 is false.
+template <size_t kVTileSize, class DF, class VF = hn::Vec<DF>>
+HWY_INLINE void QDotKTile148FloatNotNative(
+    DF df, const float* HWY_RESTRICT q, const uint32_t* HWY_RESTRICT q_offsets,
+    size_t half_cols, const MatPtrT<KV_t>& k, size_t pos, VF& sum00, VF& sum01,
+    VF& HWY_MAYBE_UNUSED sum10, VF& HWY_MAYBE_UNUSED sum11,
+    VF& HWY_MAYBE_UNUSED sum20, VF& HWY_MAYBE_UNUSED sum21,
+    VF& HWY_MAYBE_UNUSED sum30, VF& HWY_MAYBE_UNUSED sum31,
+    VF& HWY_MAYBE_UNUSED sum40, VF& HWY_MAYBE_UNUSED sum41,
+    VF& HWY_MAYBE_UNUSED sum50, VF& HWY_MAYBE_UNUSED sum51,
+    VF& HWY_MAYBE_UNUSED sum60, VF& HWY_MAYBE_UNUSED sum61,
+    VF& HWY_MAYBE_UNUSED sum70, VF& HWY_MAYBE_UNUSED sum71) {
+  ZeroResults<kVTileSize>(df, sum00, sum10, sum20, sum30, sum40, sum50, sum60,
+                          sum70);
+  ZeroResults<kVTileSize>(df, sum01, sum11, sum21, sum31, sum41, sum51, sum61,
+                          sum71);
+  using DBF = hn::ScalableTag<BF16>;
+  const DBF dbf;
+  using VBF = hn::Vec<DBF>;
+  const size_t kNF = hn::Lanes(df);
+  const float* HWY_RESTRICT q_base[kVTileSize];
+  for (size_t i = 0; i < kVTileSize; ++i) {
+    q_base[i] = q + q_offsets[i];
+  }
+  const BF16* HWY_RESTRICT k_base = k.Row(pos / (2 * kNF));
+  for (size_t i = 0; i < half_cols; ++i, k_base += kNF * 4) {
+    // TODO(rays): Replace with decompress2.
+    VBF k0_vec = hn::LoadU(dbf, k_base);
+    VBF k1_vec = hn::LoadU(dbf, k_base + kNF * 2);
+    VF k0_even = hn::PromoteEvenTo(df, k0_vec);
+    VF k0_odd = hn::PromoteOddTo(df, k0_vec);
+    VF k1_even = hn::PromoteEvenTo(df, k1_vec);
+    VF k1_odd = hn::PromoteOddTo(df, k1_vec);
+    VF q0_even = hn::Set(df, q_base[0][i * 2]);
+    VF q0_odd = hn::Set(df, q_base[0][i * 2 + 1]);
+    sum00 = hn::MulAdd(q0_even, k0_even, sum00);
+    sum01 = hn::MulAdd(q0_even, k1_even, sum01);
+    sum00 = hn::MulAdd(q0_odd, k0_odd, sum00);
+    sum01 = hn::MulAdd(q0_odd, k1_odd, sum01);
+    if constexpr (kVTileSize >= 4) {
+      VF q1_even = hn::Set(df, q_base[1][i * 2]);
+      VF q1_odd = hn::Set(df, q_base[1][i * 2 + 1]);
+      sum10 = hn::MulAdd(q1_even, k0_even, sum10);
+      sum11 = hn::MulAdd(q1_even, k1_even, sum11);
+      sum10 = hn::MulAdd(q1_odd, k0_odd, sum10);
+      sum11 = hn::MulAdd(q1_odd, k1_odd, sum11);
+      VF q2_even = hn::Set(df, q_base[2][i * 2]);
+      VF q2_odd = hn::Set(df, q_base[2][i * 2 + 1]);
+      sum20 = hn::MulAdd(q2_even, k0_even, sum20);
+      sum21 = hn::MulAdd(q2_even, k1_even, sum21);
+      sum20 = hn::MulAdd(q2_odd, k0_odd, sum20);
+      sum21 = hn::MulAdd(q2_odd, k1_odd, sum21);
+      VF q3_even = hn::Set(df, q_base[3][i * 2]);
+      VF q3_odd = hn::Set(df, q_base[3][i * 2 + 1]);
+      sum30 = hn::MulAdd(q3_even, k0_even, sum30);
+      sum31 = hn::MulAdd(q3_even, k1_even, sum31);
+      sum30 = hn::MulAdd(q3_odd, k0_odd, sum30);
+      sum31 = hn::MulAdd(q3_odd, k1_odd, sum31);
+    }
+    if constexpr (kVTileSize >= 8) {
+      VF q4_even = hn::Set(df, q_base[4][i * 2]);
+      VF q4_odd = hn::Set(df, q_base[4][i * 2 + 1]);
+      sum40 = hn::MulAdd(q4_even, k0_even, sum40);
+      sum41 = hn::MulAdd(q4_even, k1_even, sum41);
+      sum40 = hn::MulAdd(q4_odd, k0_odd, sum40);
+      sum41 = hn::MulAdd(q4_odd, k1_odd, sum41);
+      VF q5_even = hn::Set(df, q_base[5][i * 2]);
+      VF q5_odd = hn::Set(df, q_base[5][i * 2 + 1]);
+      sum50 = hn::MulAdd(q5_even, k0_even, sum50);
+      sum51 = hn::MulAdd(q5_even, k1_even, sum51);
+      sum50 = hn::MulAdd(q5_odd, k0_odd, sum50);
+      sum51 = hn::MulAdd(q5_odd, k1_odd, sum51);
+      VF q6_even = hn::Set(df, q_base[6][i * 2]);
+      VF q6_odd = hn::Set(df, q_base[6][i * 2 + 1]);
+      sum60 = hn::MulAdd(q6_even, k0_even, sum60);
+      sum61 = hn::MulAdd(q6_even, k1_even, sum61);
+      sum60 = hn::MulAdd(q6_odd, k0_odd, sum60);
+      sum61 = hn::MulAdd(q6_odd, k1_odd, sum61);
+      VF q7_even = hn::Set(df, q_base[7][i * 2]);
+      VF q7_odd = hn::Set(df, q_base[7][i * 2 + 1]);
+      sum70 = hn::MulAdd(q7_even, k0_even, sum70);
+      sum71 = hn::MulAdd(q7_even, k1_even, sum71);
+      sum70 = hn::MulAdd(q7_odd, k0_odd, sum70);
+      sum71 = hn::MulAdd(q7_odd, k1_odd, sum71);
+    }
+  }
 }
 
-// Returns the element-wise sum of 8 vectors, in a single vector.
-template <class DF, class VF = hn::Vec<DF>>
-VF HWY_INLINE ElementwiseSumOf8(DF df, const VF& x0, const VF& x1, const VF& x2,
-                                const VF& x3, const VF& x4, const VF& x5,
-                                const VF& x6, const VF& x7) {
-  VF sum0 = hn::Add(x0, x1);
-  VF sum1 = hn::Add(x2, x3);
-  VF sum2 = hn::Add(x4, x5);
-  VF sum3 = hn::Add(x6, x7);
-  sum0 = hn::Add(sum0, sum1);
-  sum2 = hn::Add(sum2, sum3);
-  return hn::Add(sum0, sum2);
-}
-
-// Sweeps a tile of NF Q rows by 8 K timesteps accumulators from start_pos to
-// min_last_pos, then sweeps the remaining timesteps in the range (min_last_pos,
-// max_last_pos].
-void TileFlashAttention(
-    const MatPtrT<BF16>& q, const uint32_t* HWY_RESTRICT q_offsets,
-    const StridedView<BF16>& qT, const MatPtrT<KV_t>& k, const size_t start_pos,
-    const uint32_t* HWY_RESTRICT last_pos, const size_t min_last_pos,
-    const size_t max_last_pos, const MatPtrT<KV_t>& v, const size_t layer_idx,
-    const AttentionActivationsPtrs& activations, MatPtrT<float>& att_out,
-    const uint32_t* HWY_RESTRICT out_offsets, ThreadingContext& ctx,
-    const size_t worker) {
-  GCPP_ZONE(ctx, worker, Zones::kFlashAttentionTileFlashAttention);
-  constexpr size_t kHTileSize = kNFx8HTileSize;
+// Loads an adjacent pair of floats, converts them to BF16, and broadcasts them
+// across a vector of BF16 as alternating odd and even elements.
+// hn::ReorderDemote2To(dbf, q_1_float, q_1_float); with q1_float containing
+// alternating odd and even floats appears not to do this.
+HWY_INLINE hn::Vec<hn::ScalableTag<BF16>> DemoteAndBroadcast2ToBF16(
+    const float* HWY_RESTRICT base) {
   using DF = hn::ScalableTag<float>;
   const DF df;
   using VF = hn::Vec<DF>;
-  using DI = hn::ScalableTag<uint32_t>;
-  const DI di;
-  using VI = hn::Vec<DI>;
-  const size_t kVTileSize = hn::Lanes(df);
+  VF v_even = hn::Set(df, base[0]);
+  VF v_odd = hn::Set(df, base[1]);
+  VF interleaved = hn::OddEven(v_odd, v_even);
+  return hn::OrderedDemote2To(hn::ScalableTag<BF16>(), interleaved,
+                              interleaved);
+}
+
+// Returns a tile of 1, 4 or 8 Q rows by 2NF K Q.K dot products, in float32.
+// K is always pre-transposed to shape:
+// [seq_len / 2kNF, layers * kv_heads * qkv_dim/2 * 2kNF * 2], where the /2, *2
+// represents that pairs of qkv_dim elements are kept together to make best use
+// of BF16 dot product instructions.
+// Note that this version assumes that Q is float32, and not transposed, and
+// HWY_NATIVE_DOT_BF16 is true.
+template <size_t kVTileSize, class DF, class VF = hn::Vec<DF>>
+HWY_INLINE void QDotKTile148FloatNative(
+    DF df, const float* HWY_RESTRICT q, const uint32_t* HWY_RESTRICT q_offsets,
+    size_t half_cols, const MatPtrT<KV_t>& k, size_t pos, VF& sum00, VF& sum01,
+    VF& HWY_MAYBE_UNUSED sum10, VF& HWY_MAYBE_UNUSED sum11,
+    VF& HWY_MAYBE_UNUSED sum20, VF& HWY_MAYBE_UNUSED sum21,
+    VF& HWY_MAYBE_UNUSED sum30, VF& HWY_MAYBE_UNUSED sum31,
+    VF& HWY_MAYBE_UNUSED sum40, VF& HWY_MAYBE_UNUSED sum41,
+    VF& HWY_MAYBE_UNUSED sum50, VF& HWY_MAYBE_UNUSED sum51,
+    VF& HWY_MAYBE_UNUSED sum60, VF& HWY_MAYBE_UNUSED sum61,
+    VF& HWY_MAYBE_UNUSED sum70, VF& HWY_MAYBE_UNUSED sum71) {
+  ZeroResults<kVTileSize>(df, sum00, sum10, sum20, sum30, sum40, sum50, sum60,
+                          sum70);
+  ZeroResults<kVTileSize>(df, sum01, sum11, sum21, sum31, sum41, sum51, sum61,
+                          sum71);
+  VF unused = hn::Zero(df);
+  using DBF = hn::ScalableTag<BF16>;
+  const DBF dbf;
+  using VBF = hn::Vec<DBF>;
+  const size_t kNF = hn::Lanes(df);
+  const float* HWY_RESTRICT q_base[kVTileSize];
   for (size_t i = 0; i < kVTileSize; ++i) {
-    hwy::ZeroBytes(att_out.Row(0) + out_offsets[i],
-                   v.Cols() * sizeof(att_out.Row(0)[0]));
+    q_base[i] = q + q_offsets[i];
   }
-  VI lasts = hn::LoadU(di, last_pos);
-  VF old_m = hn::Set(df, -std::numeric_limits<float>::max() / 2.0f);
-  VF old_d = hn::Zero(df);
-  const BF16* HWY_RESTRICT qT_row = qT.Row(0);
-  const size_t qT_stride = qT.Stride();
-  size_t position = start_pos;
-  while (position + kHTileSize - 1 <= min_last_pos) {
-    size_t k_pos[kHTileSize];
-    for (size_t i = 0; i < kHTileSize; ++i) {
-      k_pos[i] = activations.div_seq_len.Remainder(position + i);
+  const BF16* HWY_RESTRICT k_base = k.Row(pos / (2 * kNF));
+  for (size_t i = 0; i < half_cols; ++i, k_base += kNF * 4) {
+    VBF kvec0 = hn::LoadU(dbf, k_base);
+    VBF kvec1 = hn::LoadU(dbf, k_base + kNF * 2);
+    VBF q0_bf16 = DemoteAndBroadcast2ToBF16(q_base[0] + i * 2);
+    sum00 = hn::ReorderWidenMulAccumulate(df, q0_bf16, kvec0, sum00, unused);
+    sum01 = hn::ReorderWidenMulAccumulate(df, q0_bf16, kvec1, sum01, unused);
+    if constexpr (kVTileSize >= 4) {
+      VBF q1_bf16 = DemoteAndBroadcast2ToBF16(q_base[1] + i * 2);
+      sum10 = hn::ReorderWidenMulAccumulate(df, q1_bf16, kvec0, sum10, unused);
+      sum11 = hn::ReorderWidenMulAccumulate(df, q1_bf16, kvec1, sum11, unused);
+      VBF q2_bf16 = DemoteAndBroadcast2ToBF16(q_base[2] + i * 2);
+      sum20 = hn::ReorderWidenMulAccumulate(df, q2_bf16, kvec0, sum20, unused);
+      sum21 = hn::ReorderWidenMulAccumulate(df, q2_bf16, kvec1, sum21, unused);
+      VBF q3_bf16 = DemoteAndBroadcast2ToBF16(q_base[3] + i * 2);
+      sum30 = hn::ReorderWidenMulAccumulate(df, q3_bf16, kvec0, sum30, unused);
+      sum31 = hn::ReorderWidenMulAccumulate(df, q3_bf16, kvec1, sum31, unused);
     }
-    VF x0, x1, x2, x3, x4, x5, x6, x7;
-    QDotKTile(df, qT_row, qT_stride, k, k_pos, x0, x1, x2, x3, x4, x5, x6, x7);
-    if (activations.config.att_cap > 0.0f) {
-      // Compute tanh(x / cap) * cap, being LogitsSoftCap on the tile.
-      VF cap = hn::Set(df, activations.config.att_cap);
-      VF one_over_cap = hn::Div(hn::Set(df, 1.0f), cap);
-      x0 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x0, one_over_cap)));
-      x1 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x1, one_over_cap)));
-      x2 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x2, one_over_cap)));
-      x3 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x3, one_over_cap)));
-      x4 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x4, one_over_cap)));
-      x5 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x5, one_over_cap)));
-      x6 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x6, one_over_cap)));
-      x7 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x7, one_over_cap)));
+    if constexpr (kVTileSize >= 8) {
+      VBF q4_bf16 = DemoteAndBroadcast2ToBF16(q_base[4] + i * 2);
+      sum40 = hn::ReorderWidenMulAccumulate(df, q4_bf16, kvec0, sum40, unused);
+      sum41 = hn::ReorderWidenMulAccumulate(df, q4_bf16, kvec1, sum41, unused);
+      VBF q5_bf16 = DemoteAndBroadcast2ToBF16(q_base[5] + i * 2);
+      sum50 = hn::ReorderWidenMulAccumulate(df, q5_bf16, kvec0, sum50, unused);
+      sum51 = hn::ReorderWidenMulAccumulate(df, q5_bf16, kvec1, sum51, unused);
+      VBF q6_bf16 = DemoteAndBroadcast2ToBF16(q_base[6] + i * 2);
+      sum60 = hn::ReorderWidenMulAccumulate(df, q6_bf16, kvec0, sum60, unused);
+      sum61 = hn::ReorderWidenMulAccumulate(df, q6_bf16, kvec1, sum61, unused);
+      VBF q7_bf16 = DemoteAndBroadcast2ToBF16(q_base[7] + i * 2);
+      sum70 = hn::ReorderWidenMulAccumulate(df, q7_bf16, kvec0, sum70, unused);
+      sum71 = hn::ReorderWidenMulAccumulate(df, q7_bf16, kvec1, sum71, unused);
     }
-    VF m = ElementwiseMaxOf8(df, x0, x1, x2, x3, x4, x5, x6, x7);
-    m = hn::Max(old_m, m);
-    x0 = hn::Exp(df, hn::Sub(x0, m));
-    x1 = hn::Exp(df, hn::Sub(x1, m));
-    x2 = hn::Exp(df, hn::Sub(x2, m));
-    x3 = hn::Exp(df, hn::Sub(x3, m));
-    x4 = hn::Exp(df, hn::Sub(x4, m));
-    x5 = hn::Exp(df, hn::Sub(x5, m));
-    x6 = hn::Exp(df, hn::Sub(x6, m));
-    x7 = hn::Exp(df, hn::Sub(x7, m));
-    VF scale = hn::Mul(old_d, hn::Exp(df, hn::Sub(old_m, m)));
-    old_d = ElementwiseSumOf8(df, x0, x1, x2, x3, x4, x5, x6, x7);
-    old_d = hn::Add(scale, old_d);
-    old_m = m;
-    VF one_over_d = hn::Div(hn::Set(df, 1.0f), old_d);
-    scale = hn::Mul(scale, one_over_d);
-    x0 = hn::Mul(x0, one_over_d);
-    x1 = hn::Mul(x1, one_over_d);
-    x2 = hn::Mul(x2, one_over_d);
-    x3 = hn::Mul(x3, one_over_d);
-    x4 = hn::Mul(x4, one_over_d);
-    x5 = hn::Mul(x5, one_over_d);
-    x6 = hn::Mul(x6, one_over_d);
-    x7 = hn::Mul(x7, one_over_d);
-    MulByConstAndAddTile(df, scale, x0, x1, x2, x3, x4, x5, x6, x7, v, k_pos,
-                         att_out.Row(0), out_offsets, v.Cols());
-    position += kHTileSize;
-  }
-  while (position <= max_last_pos) {
-    size_t k_pos = activations.div_seq_len.Remainder(position);
-    VF x0 = QDotKVector(df, q_offsets, k_pos, q, k);
-    if (activations.config.att_cap > 0.0f) {
-      // Compute tanh(x / cap) * cap, being LogitsSoftCap on the vector.
-      VF cap = hn::Set(df, activations.config.att_cap);
-      VF one_over_cap = hn::Div(hn::Set(df, 1.0f), cap);
-      x0 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x0, one_over_cap)));
-    }
-    // Past the last position, x0 doesn't count.
-    auto mask = hn::Gt(hn::Set(di, position), lasts);
-    VF causal_offset = hn::MaskedSet(df, RebindMask(df, mask),
-                                     std::numeric_limits<float>::max() / 2.0f);
-    x0 = hn::Sub(x0, causal_offset);
-    VF m = hn::Max(old_m, x0);
-    x0 = hn::Exp(df, hn::Sub(x0, m));
-    VF scale = hn::Mul(old_d, hn::Exp(df, hn::Sub(old_m, m)));
-    old_m = m;
-    old_d = hn::Add(scale, x0);
-    VF one_over_d = hn::Div(hn::Set(df, 1.0f), old_d);
-    x0 = hn::Mul(x0, one_over_d);
-    scale = hn::Mul(scale, one_over_d);
-    MulByConstAndAddVector(df, scale, x0, v, k_pos, att_out.Row(0), out_offsets,
-                           v.Cols());
-    ++position;
   }
 }
 
-// Returns an 4 Q rows by NF K tile of Q.K dot products, in single precision.
-// This is the result of 4 rows of Q against NF K timesteps, with positions
-// given by k_offsets[0..NF].
-template <class DF, class VF = hn::Vec<DF>>
-void QDotKTilex4(DF df, const BF16* HWY_RESTRICT q,
-                 const uint32_t* HWY_RESTRICT q_offsets, const MatPtrT<KV_t>& k,
-                 const int32_t* HWY_RESTRICT k_offsets, VF& sum0, VF& sum1,
-                 VF& sum2, VF& sum3) {
-  sum0 = hn::Zero(df);
-  sum1 = hn::Zero(df);
-  sum2 = hn::Zero(df);
-  sum3 = hn::Zero(df);
-  const float* HWY_RESTRICT k_base = k.Row(0);
-  using DI = hn::ScalableTag<int32_t>;
-  const DI di;
-  using VI = hn::Vec<DI>;
-  VI k_offsets_vec = hn::LoadU(di, k_offsets);
-  for (size_t i = 0; i < k.Cols(); ++i) {
-    VF k_vec = hn::GatherIndex(df, k_base + i, k_offsets_vec);
-    VF q_0 = hn::Set(df, hwy::ConvertScalarTo<float>(q[q_offsets[0] + i]));
-    sum0 = hn::MulAdd(q_0, k_vec, sum0);
-    VF q_1 = hn::Set(df, hwy::ConvertScalarTo<float>(q[q_offsets[1] + i]));
-    sum1 = hn::MulAdd(q_1, k_vec, sum1);
-    VF q_2 = hn::Set(df, hwy::ConvertScalarTo<float>(q[q_offsets[2] + i]));
-    sum2 = hn::MulAdd(q_2, k_vec, sum2);
-    VF q_3 = hn::Set(df, hwy::ConvertScalarTo<float>(q[q_offsets[3] + i]));
-    sum3 = hn::MulAdd(q_3, k_vec, sum3);
+// Returns a tile of 1, 4 or 8 Q rows by 2NF K Q.K dot products, in float32.
+// K is always pre-transposed to shape:
+// [seq_len / 2kNF, layers * kv_heads * qkv_dim/2 * 2kNF * 2], where the /2, *2
+// represents that pairs of qkv_dim elements are kept together to make best use
+// of BF16 dot product instructions.
+// Note that this is optimized for the case where q and k are bf16, but there is
+// no native_bf16 instruction.
+template <size_t kVTileSize, class DF, class VF = hn::Vec<DF>>
+HWY_INLINE void QDotKTile148BF16NotNative(
+    DF df, const BF16* HWY_RESTRICT q, const uint32_t* HWY_RESTRICT q_offsets,
+    size_t half_cols, const MatPtrT<KV_t>& k, size_t pos, VF& sum00, VF& sum01,
+    VF& HWY_MAYBE_UNUSED sum10, VF& HWY_MAYBE_UNUSED sum11,
+    VF& HWY_MAYBE_UNUSED sum20, VF& HWY_MAYBE_UNUSED sum21,
+    VF& HWY_MAYBE_UNUSED sum30, VF& HWY_MAYBE_UNUSED sum31,
+    VF& HWY_MAYBE_UNUSED sum40, VF& HWY_MAYBE_UNUSED sum41,
+    VF& HWY_MAYBE_UNUSED sum50, VF& HWY_MAYBE_UNUSED sum51,
+    VF& HWY_MAYBE_UNUSED sum60, VF& HWY_MAYBE_UNUSED sum61,
+    VF& HWY_MAYBE_UNUSED sum70, VF& HWY_MAYBE_UNUSED sum71) {
+  ZeroResults<kVTileSize>(df, sum00, sum10, sum20, sum30, sum40, sum50, sum60,
+                          sum70);
+  ZeroResults<kVTileSize>(df, sum01, sum11, sum21, sum31, sum41, sum51, sum61,
+                          sum71);
+  using DBF = hn::ScalableTag<BF16>;
+  const DBF dbf;
+  using VBF = hn::Vec<DBF>;
+  const size_t kNF = hn::Lanes(df);
+  const float* HWY_RESTRICT q_base[kVTileSize];
+  for (size_t i = 0; i < kVTileSize; ++i) {
+    q_base[i] = reinterpret_cast<const float*>(q + q_offsets[i]);
+  }
+  const BF16* HWY_RESTRICT k_base = k.Row(pos / (2 * kNF));
+  for (size_t i = 0; i < half_cols; ++i, k_base += kNF * 4) {
+    VBF kvec0 = hn::LoadU(dbf, k_base);
+    VBF kvec1 = hn::LoadU(dbf, k_base + kNF * 2);
+    VBF q0 = hn::BitCast(dbf, hn::Set(df, q_base[0][i]));
+    VF k0_even = hn::PromoteEvenTo(df, kvec0);
+    VF k0_odd = hn::PromoteOddTo(df, kvec0);
+    VF k1_even = hn::PromoteEvenTo(df, kvec1);
+    VF k1_odd = hn::PromoteOddTo(df, kvec1);
+    VF q0_even = hn::PromoteEvenTo(df, q0);
+    sum00 = hn::MulAdd(q0_even, k0_even, sum00);
+    sum01 = hn::MulAdd(q0_even, k1_even, sum01);
+    VF q0_odd = hn::PromoteOddTo(df, q0);
+    sum00 = hn::MulAdd(q0_odd, k0_odd, sum00);
+    sum01 = hn::MulAdd(q0_odd, k1_odd, sum01);
+    if constexpr (kVTileSize >= 4) {
+      VBF q1 = hn::BitCast(dbf, hn::Set(df, q_base[1][i]));
+      VF q1_even = hn::PromoteEvenTo(df, q1);
+      sum10 = hn::MulAdd(q1_even, k0_even, sum10);
+      sum11 = hn::MulAdd(q1_even, k1_even, sum11);
+      VF q1_odd = hn::PromoteOddTo(df, q1);
+      sum10 = hn::MulAdd(q1_odd, k0_odd, sum10);
+      sum11 = hn::MulAdd(q1_odd, k1_odd, sum11);
+      VBF q2 = hn::BitCast(dbf, hn::Set(df, q_base[2][i]));
+      VF q2_even = hn::PromoteEvenTo(df, q2);
+      sum20 = hn::MulAdd(q2_even, k0_even, sum20);
+      sum21 = hn::MulAdd(q2_even, k1_even, sum21);
+      VF q2_odd = hn::PromoteOddTo(df, q2);
+      sum20 = hn::MulAdd(q2_odd, k0_odd, sum20);
+      sum21 = hn::MulAdd(q2_odd, k1_odd, sum21);
+      VBF q3 = hn::BitCast(dbf, hn::Set(df, q_base[3][i]));
+      VF q3_even = hn::PromoteEvenTo(df, q3);
+      sum30 = hn::MulAdd(q3_even, k0_even, sum30);
+      sum31 = hn::MulAdd(q3_even, k1_even, sum31);
+      VF q3_odd = hn::PromoteOddTo(df, q3);
+      sum30 = hn::MulAdd(q3_odd, k0_odd, sum30);
+      sum31 = hn::MulAdd(q3_odd, k1_odd, sum31);
+    }
+    if constexpr (kVTileSize >= 8) {
+      VBF q4 = hn::BitCast(dbf, hn::Set(df, q_base[4][i]));
+      VF q4_even = hn::PromoteEvenTo(df, q4);
+      sum40 = hn::MulAdd(q4_even, k0_even, sum40);
+      sum41 = hn::MulAdd(q4_even, k1_even, sum41);
+      VF q4_odd = hn::PromoteOddTo(df, q4);
+      sum40 = hn::MulAdd(q4_odd, k0_odd, sum40);
+      sum41 = hn::MulAdd(q4_odd, k1_odd, sum41);
+      VBF q5 = hn::BitCast(dbf, hn::Set(df, q_base[5][i]));
+      VF q5_even = hn::PromoteEvenTo(df, q5);
+      sum50 = hn::MulAdd(q5_even, k0_even, sum50);
+      sum51 = hn::MulAdd(q5_even, k1_even, sum51);
+      VF q5_odd = hn::PromoteOddTo(df, q5);
+      sum50 = hn::MulAdd(q5_odd, k0_odd, sum50);
+      sum51 = hn::MulAdd(q5_odd, k1_odd, sum51);
+      VBF q6 = hn::BitCast(dbf, hn::Set(df, q_base[6][i]));
+      VF q6_even = hn::PromoteEvenTo(df, q6);
+      sum60 = hn::MulAdd(q6_even, k0_even, sum60);
+      sum61 = hn::MulAdd(q6_even, k1_even, sum61);
+      VF q6_odd = hn::PromoteOddTo(df, q6);
+      sum60 = hn::MulAdd(q6_odd, k0_odd, sum60);
+      sum61 = hn::MulAdd(q6_odd, k1_odd, sum61);
+      VBF q7 = hn::BitCast(dbf, hn::Set(df, q_base[7][i]));
+      VF q7_even = hn::PromoteEvenTo(df, q7);
+      sum70 = hn::MulAdd(q7_even, k0_even, sum70);
+      sum71 = hn::MulAdd(q7_even, k1_even, sum71);
+      VF q7_odd = hn::PromoteOddTo(df, q7);
+      sum70 = hn::MulAdd(q7_odd, k0_odd, sum70);
+      sum71 = hn::MulAdd(q7_odd, k1_odd, sum71);
+    }
+  }
+}
+
+// Returns a tile of 1, 4 or 8 Q rows by 2NF K Q.K dot products, in float32.
+// K is always pre-transposed to shape:
+// [seq_len / 2kNF, layers * kv_heads * qkv_dim/2 * 2kNF * 2], where the /2, *2
+// represents that pairs of qkv_dim elements are kept together to make best use
+// of BF16 dot product instructions.
+// Note that this is optimized for the case where q and k are bf16, and there is
+// a native_bf16 instruction.
+template <size_t kVTileSize, class DF, class VF = hn::Vec<DF>>
+HWY_INLINE void QDotKTile148BF16Native(
+    DF df, const BF16* HWY_RESTRICT q, const uint32_t* HWY_RESTRICT q_offsets,
+    size_t half_cols, const MatPtrT<KV_t>& k, size_t pos, VF& sum00, VF& sum01,
+    VF& HWY_MAYBE_UNUSED sum10, VF& HWY_MAYBE_UNUSED sum11,
+    VF& HWY_MAYBE_UNUSED sum20, VF& HWY_MAYBE_UNUSED sum21,
+    VF& HWY_MAYBE_UNUSED sum30, VF& HWY_MAYBE_UNUSED sum31,
+    VF& HWY_MAYBE_UNUSED sum40, VF& HWY_MAYBE_UNUSED sum41,
+    VF& HWY_MAYBE_UNUSED sum50, VF& HWY_MAYBE_UNUSED sum51,
+    VF& HWY_MAYBE_UNUSED sum60, VF& HWY_MAYBE_UNUSED sum61,
+    VF& HWY_MAYBE_UNUSED sum70, VF& HWY_MAYBE_UNUSED sum71) {
+  ZeroResults<kVTileSize>(df, sum00, sum10, sum20, sum30, sum40, sum50, sum60,
+                          sum70);
+  ZeroResults<kVTileSize>(df, sum01, sum11, sum21, sum31, sum41, sum51, sum61,
+                          sum71);
+  VF unused_sum1 = hn::Zero(df);
+  using DBF = hn::ScalableTag<BF16>;
+  const DBF dbf;
+  using VBF = hn::Vec<DBF>;
+  const size_t kNF = hn::Lanes(df);
+  const float* HWY_RESTRICT q_base[kVTileSize];
+  for (size_t i = 0; i < kVTileSize; ++i) {
+    q_base[i] = reinterpret_cast<const float*>(q + q_offsets[i]);
+  }
+  const BF16* HWY_RESTRICT k_base = k.Row(pos / (2 * kNF));
+  for (size_t i = 0; i < half_cols; ++i, k_base += kNF * 4) {
+    VBF k0_vec = hn::LoadU(dbf, k_base);
+    VBF k1_vec = hn::LoadU(dbf, k_base + kNF * 2);
+    VBF q0 = hn::BitCast(dbf, hn::Set(df, q_base[0][i]));
+    sum00 = hn::ReorderWidenMulAccumulate(df, q0, k0_vec, sum00, unused_sum1);
+    sum01 = hn::ReorderWidenMulAccumulate(df, q0, k1_vec, sum01, unused_sum1);
+    if constexpr (kVTileSize >= 4) {
+      VBF q1 = hn::BitCast(dbf, hn::Set(df, q_base[1][i]));
+      sum10 = hn::ReorderWidenMulAccumulate(df, q1, k0_vec, sum10, unused_sum1);
+      sum11 = hn::ReorderWidenMulAccumulate(df, q1, k1_vec, sum11, unused_sum1);
+      VBF q2 = hn::BitCast(dbf, hn::Set(df, q_base[2][i]));
+      sum20 = hn::ReorderWidenMulAccumulate(df, q2, k0_vec, sum20, unused_sum1);
+      sum21 = hn::ReorderWidenMulAccumulate(df, q2, k1_vec, sum21, unused_sum1);
+      VBF q3 = hn::BitCast(dbf, hn::Set(df, q_base[3][i]));
+      sum30 = hn::ReorderWidenMulAccumulate(df, q3, k0_vec, sum30, unused_sum1);
+      sum31 = hn::ReorderWidenMulAccumulate(df, q3, k1_vec, sum31, unused_sum1);
+    }
+    if constexpr (kVTileSize >= 8) {
+      VBF q4 = hn::BitCast(dbf, hn::Set(df, q_base[4][i]));
+      sum40 = hn::ReorderWidenMulAccumulate(df, q4, k0_vec, sum40, unused_sum1);
+      sum41 = hn::ReorderWidenMulAccumulate(df, q4, k1_vec, sum41, unused_sum1);
+      VBF q5 = hn::BitCast(dbf, hn::Set(df, q_base[5][i]));
+      sum50 = hn::ReorderWidenMulAccumulate(df, q5, k0_vec, sum50, unused_sum1);
+      sum51 = hn::ReorderWidenMulAccumulate(df, q5, k1_vec, sum51, unused_sum1);
+      VBF q6 = hn::BitCast(dbf, hn::Set(df, q_base[6][i]));
+      sum60 = hn::ReorderWidenMulAccumulate(df, q6, k0_vec, sum60, unused_sum1);
+      sum61 = hn::ReorderWidenMulAccumulate(df, q6, k1_vec, sum61, unused_sum1);
+      VBF q7 = hn::BitCast(dbf, hn::Set(df, q_base[7][i]));
+      sum70 = hn::ReorderWidenMulAccumulate(df, q7, k0_vec, sum70, unused_sum1);
+      sum71 = hn::ReorderWidenMulAccumulate(df, q7, k1_vec, sum71, unused_sum1);
+    }
   }
 }
 
 // Handles NF v rows of flash attention for NF q.k dot products from one q row.
+// Automatically handles masking for causal attention and different start_pos
+// and last_pos values.
 template <class DF, class VF = hn::Vec<DF>>
-float HWY_INLINE SingleFlashAttentionRowVector(DF df, VF& x, float& old_max,
+HWY_INLINE float SingleFlashAttentionRowVector(DF df, size_t start_pos,
+                                               size_t pos, size_t last_pos,
+                                               VF& x, float& old_max,
                                                float& old_d) {
+  if (pos < start_pos) {
+    size_t mask_size = start_pos - pos;
+    const VF neg_inf = hn::Neg(hn::Inf(df));
+    x = hn::IfThenElse(hn::FirstN(df, mask_size), neg_inf, x);
+  }
+  if (pos + hn::Lanes(df) > last_pos) {
+    size_t mask_size = pos <= last_pos ? last_pos + 1 - pos : 0;
+    const VF neg_inf = hn::Neg(hn::Inf(df));
+    x = hn::IfThenElse(hn::FirstN(df, mask_size), x, neg_inf);
+  }
   float m = hn::ReduceMax(df, x);
   m = std::max(m, old_max);
   x = hn::Exp(df, hn::Sub(x, hn::Set(df, m)));
@@ -435,6 +498,60 @@ float HWY_INLINE SingleFlashAttentionRowVector(DF df, VF& x, float& old_max,
   } else {
     scale = 0.0f;
     x = hn::Zero(df);
+  }
+  return scale;
+}
+
+// Handles 2NF v rows of flash attention for 2NF q.k dot products from 1 q row.
+// Automatically handles masking for causal attention and different start_pos
+// and last_pos values.
+template <class DF, class VF = hn::Vec<DF>>
+HWY_INLINE float DoubleFlashAttentionRowVector(DF df, size_t start_pos,
+                                               size_t pos, size_t last_pos,
+                                               VF& x0, VF& x1, float& old_max,
+                                               float& old_d) {
+  const size_t kNF = hn::Lanes(df);
+  const VF neg_inf = hn::Neg(hn::Inf(df));
+  if (pos < start_pos) {
+    if (pos + kNF <= start_pos) {
+      x0 = neg_inf;
+      size_t mask_size = start_pos - (pos + kNF);
+      x1 = hn::IfThenElse(hn::FirstN(df, mask_size), neg_inf, x1);
+    } else {
+      size_t mask_size = start_pos - pos;
+      x0 = hn::IfThenElse(hn::FirstN(df, mask_size), neg_inf, x0);
+    }
+  }
+  if (pos + 2 * kNF > last_pos) {
+    if (pos + kNF > last_pos) {
+      size_t mask_size = pos <= last_pos ? last_pos + 1 - pos : 0;
+      x0 = hn::IfThenElse(hn::FirstN(df, mask_size), x0, neg_inf);
+      x1 = neg_inf;
+    } else {
+      size_t mask_size = last_pos + 1 - (pos + kNF);
+      x1 = hn::IfThenElse(hn::FirstN(df, mask_size), x1, neg_inf);
+    }
+  }
+  VF x_max = hn::Max(x0, x1);
+  float m = hn::ReduceMax(df, x_max);
+  m = std::max(m, old_max);
+  VF m_vec = hn::Set(df, m);
+  x0 = hn::Exp(df, hn::Sub(x0, m_vec));
+  x1 = hn::Exp(df, hn::Sub(x1, m_vec));
+  float scale = old_d * std::exp(old_max - m);
+  VF x_sum = hn::Add(x0, x1);
+  old_d = hn::ReduceSum(df, x_sum) + scale;
+  old_max = m;
+  if (old_d > 0.0f) {
+    const float one_over_d = 1.0f / old_d;
+    scale *= one_over_d;
+    VF one_over_d_vec = hn::Set(df, one_over_d);
+    x0 = hn::Mul(x0, one_over_d_vec);
+    x1 = hn::Mul(x1, one_over_d_vec);
+  } else {
+    scale = 0.0f;
+    x0 = hn::Zero(df);
+    x1 = hn::Zero(df);
   }
   return scale;
 }
@@ -590,159 +707,522 @@ static HWY_INLINE void FlashAttentionTileStepAndApplySoftCap(
   }
 }
 
-// Implements flash attention for a strip of 4 query vectors.
-// It iterates through timesteps in K from `start_pos` up to `max_last_pos`.
-// Timesteps up to `min_last_pos` (*) are processed in tiles of shape 4 Q rows
-// by NF timesteps in K for efficiency while timesteps between `min_last_pos +
-// 1` and `max_last_pos` are processed one-by-one to handle differing `last_pos`
-// values within the strip.
-// (*) Actually, it only iterates through
-// `min_last_pos - (min_last_pos + 1 - start_pos) % NF` in tiles, as the tiled
-// computation can, for obvious reasons, only process an integer number of
-// tiles.
+// Implements flash attention for a strip of tiles of size 1, 4 or 8 query
+// vectors by 2NF positions in K.
+// It iterates through tiles in K from `params.min_start_pos / 2NF * 2NF` up to
+// `params.max_last_pos` (rounded up to the nearest multiple of 2NF).
+// Masking allows each row within a tile to have a different start and end
+// position.
 //
+// @param params FlashAttentionParams containing the extent of the strip and
+//   size of the tiles.
 // @param q The query matrix [batch_size * q_heads, qkv_dim] in BF16 format.
-// @param q_offsets Offsets from `q.Row(0)` to the start of the 4 query
-//   vectors to be processed in this tile.
-// @param k Key matrix [seq_len, qkv_dim] from KV cache.
-// @param start_pos The first token position in the KV cache to attend to.
-// @param last_pos An array of 4 indices giving the last token position
-//   (inclusive) that each of the 4 queries may attend to.
-// @param min_last_pos The minimum value in `last_pos`. Timesteps up to this
-//   position can be processed efficiently in batches.
-// @param max_last_pos The maximum value in `last_pos`. Timesteps between
-//   `min_last_pos + 1` and this position are processed individually to
-//   respect each query's `last_pos` limit.
+// @param k Key matrix from KV cache. K is always pre-transposed to shape:
+//   [seq_len / 2kNF, layers * kv_heads * qkv_dim/2 * 2kNF * 2],
+//   where the /2, *2 represents that pairs of qkv_dim elements are kept
+//   together to make best use of BF16 dot product instructions.
 // @param v Value matrix [seq_len, qkv_dim] from KV cache.
 // @param layer_idx The index of the current transformer layer.
 // @param activations Attention configurations and buffers.
 // @param att_out Output buffer for attention results.
-// @param out_offsets Offsets from `att_out.Row(0)` to store the 4 output
-//   vectors.
 // @param ctx Threading context.
 // @param worker Worker thread index.
-Tile4FlashState TileFlashAttention4(
-    const MatPtrT<BF16>& q, const uint32_t* HWY_RESTRICT q_offsets,
-    const MatPtrT<KV_t>& k, const size_t start_pos,
-    const uint32_t* HWY_RESTRICT last_pos, const size_t min_last_pos,
-    const size_t max_last_pos, const MatPtrT<KV_t>& v, const size_t layer_idx,
+template <size_t kVTileSize, typename QType, typename KVType>
+Tile4FlashState TileFlashAttention148(
+    const FlashAttentionParams& params, const MatPtrT<QType>& q,
+    const MatPtrT<KVType>& k, const MatPtrT<KVType>& v, const size_t layer_idx,
     const AttentionActivationsPtrs& activations, MatPtrT<float>& att_out,
-    const uint32_t* HWY_RESTRICT out_offsets, ThreadingContext& ctx,
-    const size_t worker) {
-  GCPP_ZONE(ctx, worker, Zones::kFlashAttentionTileFlashAttention4);
+    size_t qkv_dim, ThreadingContext& ctx, const size_t worker,
+    AttentionImpl attention_impl) {
+  constexpr Zones kZone =
+      kVTileSize == 8
+          ? Zones::kFlashAttentionTileFlashAttention8
+          : (kVTileSize == 4 ? Zones::kFlashAttentionTileFlashAttention4
+                             : Zones::kFlashAttentionTileFlashAttention1);
+  GCPP_ZONE(ctx, worker, kZone);
   using DF = hn::ScalableTag<float>;
   const DF df;
   using VF = hn::Vec<DF>;
-  constexpr size_t kMaxNF = hn::MaxLanes(df);
-  const size_t kHTileSize = hn::Lanes(df);
-  HWY_DASSERT(kHTileSize <= kMaxNF);
-  constexpr size_t kVTileSize = 4;
+  float att_cap = activations.config.att_cap;
+  float one_over_cap = att_cap > 0.0f ? 1.0f / att_cap : 0.0f;
+  const size_t kHTileSize = 2 * hn::Lanes(df);
   float scales[kVTileSize];
   for (size_t i = 0; i < kVTileSize; ++i) {
-    hwy::ZeroBytes(att_out.Row(0) + out_offsets[i],
-                   v.Cols() * sizeof(att_out.Row(0)[0]));
+    hwy::ZeroBytes(att_out.Row(0) + params.out_offsets[i],
+                   qkv_dim * sizeof(att_out.Row(0)[0]));
   }
   Tile4FlashState state;
-  size_t position = start_pos;
-  while (position + kHTileSize - 1 <= min_last_pos) {
-    int32_t k_offsets[kMaxNF];
-    size_t v_pos[kMaxNF];
+  size_t position = params.min_start_pos / kHTileSize * kHTileSize;
+  while (position <= params.max_last_pos) {
+    // Each pair of vectors covers 2NF positions in K, with up to 8 pairs of
+    // vectors covering 1, 4 or 8 queries.
+    VF x00, x01;
+    VF HWY_MAYBE_UNUSED x10, x11;
+    VF HWY_MAYBE_UNUSED x20, x21;
+    VF HWY_MAYBE_UNUSED x30, x31;
+    VF HWY_MAYBE_UNUSED x40, x41;
+    VF HWY_MAYBE_UNUSED x50, x51;
+    VF HWY_MAYBE_UNUSED x60, x61;
+    VF HWY_MAYBE_UNUSED x70, x71;
+    constexpr size_t kMaxNF = hn::MaxLanes(df);
+    size_t v_pos[2 * kMaxNF];
     for (size_t i = 0; i < kHTileSize; ++i) {
       v_pos[i] = activations.div_seq_len.Remainder(position + i);
-      k_offsets[i] = k.Row(v_pos[i]) - k.Row(0);
     }
-    VF x0, x1, x2, x3;
-    QDotKTilex4(df, q.Row(0), q_offsets, k, k_offsets, x0, x1, x2, x3);
-    if (activations.config.att_cap > 0.0f) {
+    if constexpr (IsF32<QType>()) {
+      if constexpr (HWY_NATIVE_DOT_BF16) {
+        QDotKTile148FloatNative<kVTileSize>(df, q.Row(0), params.out_offsets,
+                                            qkv_dim / 2, k, position, x00, x01,
+                                            x10, x11, x20, x21, x30, x31, x40,
+                                            x41, x50, x51, x60, x61, x70, x71);
+      } else {
+        QDotKTile148FloatNotNative<kVTileSize>(
+            df, q.Row(0), params.out_offsets, qkv_dim / 2, k, position, x00,
+            x01, x10, x11, x20, x21, x30, x31, x40, x41, x50, x51, x60, x61,
+            x70, x71);
+      }
+    } else {
+      if constexpr (HWY_NATIVE_DOT_BF16) {
+        QDotKTile148BF16Native<kVTileSize>(df, q.Row(0), params.q_offsets,
+                                           qkv_dim / 2, k, position, x00, x01,
+                                           x10, x11, x20, x21, x30, x31, x40,
+                                           x41, x50, x51, x60, x61, x70, x71);
+      } else {
+        QDotKTile148BF16NotNative<kVTileSize>(
+            df, q.Row(0), params.q_offsets, qkv_dim / 2, k, position, x00, x01,
+            x10, x11, x20, x21, x30, x31, x40, x41, x50, x51, x60, x61, x70,
+            x71);
+      }
+    }
+    if (att_cap > 0.0f) {
       // Compute tanh(x / cap) * cap, being LogitsSoftCap on the tile.
-      VF cap = hn::Set(df, activations.config.att_cap);
-      VF one_over_cap = hn::Div(hn::Set(df, 1.0f), cap);
-      x0 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x0, one_over_cap)));
-      x1 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x1, one_over_cap)));
-      x2 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x2, one_over_cap)));
-      x3 = hn::Mul(cap, hn::Tanh(df, hn::Mul(x3, one_over_cap)));
+      ApplySoftCap<kVTileSize>(df, att_cap, one_over_cap, x00, x10, x20, x30,
+                               x40, x50, x60, x70);
+      ApplySoftCap<kVTileSize>(df, att_cap, one_over_cap, x01, x11, x21, x31,
+                               x41, x51, x61, x71);
     }
-    scales[0] = SingleFlashAttentionRowVector(df, x0, state.row_states[0].max,
-                                              state.row_states[0].d);
-    scales[1] = SingleFlashAttentionRowVector(df, x1, state.row_states[1].max,
-                                              state.row_states[1].d);
-    scales[2] = SingleFlashAttentionRowVector(df, x2, state.row_states[2].max,
-                                              state.row_states[2].d);
-    scales[3] = SingleFlashAttentionRowVector(df, x3, state.row_states[3].max,
-                                              state.row_states[3].d);
-    MulByConstAndAddTile4(df, scales, x0, x1, x2, x3, v, v_pos, att_out.Row(0),
-                          out_offsets, v.Cols());
+    scales[0] = DoubleFlashAttentionRowVector(
+        df, params.start_pos[0], position, params.last_pos[0], x00, x01,
+        state.row_states[0].max, state.row_states[0].d);
+    if constexpr (kVTileSize >= 4) {
+      scales[1] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[1], position, params.last_pos[1], x10, x11,
+          state.row_states[1].max, state.row_states[1].d);
+      scales[2] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[2], position, params.last_pos[2], x20, x21,
+          state.row_states[2].max, state.row_states[2].d);
+      scales[3] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[3], position, params.last_pos[3], x30, x31,
+          state.row_states[3].max, state.row_states[3].d);
+      MulByConstAndAddVT4Mem(df, scales, x00, x01, x10, x11, x20, x21, x30, x31,
+                             v, v_pos, params.max_last_pos + 1 - position,
+                             att_out.Row(0), params.out_offsets, qkv_dim);
+    } else {
+      MulByConstAndAddVT1Mem(df, scales, x00, x01, v, v_pos,
+                             params.max_last_pos + 1 - position, att_out.Row(0),
+                             params.out_offsets, qkv_dim);
+    }
+    if constexpr (kVTileSize >= 8) {
+      scales[4] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[4], position, params.last_pos[4], x40, x41,
+          state.row_states[4].max, state.row_states[4].d);
+      scales[5] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[5], position, params.last_pos[5], x50, x51,
+          state.row_states[5].max, state.row_states[5].d);
+      scales[6] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[6], position, params.last_pos[6], x60, x61,
+          state.row_states[6].max, state.row_states[6].d);
+      scales[7] = DoubleFlashAttentionRowVector(
+          df, params.start_pos[7], position, params.last_pos[7], x70, x71,
+          state.row_states[7].max, state.row_states[7].d);
+      MulByConstAndAddVT4Mem(df, scales + 4, x40, x41, x50, x51, x60, x61, x70,
+                             x71, v, v_pos, params.max_last_pos + 1 - position,
+                             att_out.Row(0), params.out_offsets + 4, qkv_dim);
+    }
     position += kHTileSize;
-  }
-  const hn::ScalableTag<BF16> dbf;
-  const size_t qkv_dim = k.Cols();
-
-  while (position <= max_last_pos) {
-    size_t k_pos = activations.div_seq_len.Remainder(position);
-    if (position <= last_pos[0]) {
-      // Past the last position, x0 doesn't count.
-      float x0 = Dot(dbf, MakeConstSpan(q.Row(0) + q_offsets[0], qkv_dim), 0,
-                     k.Row(k_pos), qkv_dim);
-      SingleFlashAttentionStep(x0, activations.config.att_cap,
-                               state.row_states[0].max, state.row_states[0].d,
-                               v.Row(k_pos), v.Cols(),
-                               att_out.Row(0) + out_offsets[0]);
-    }
-    if (position <= last_pos[1]) {
-      // Past the last position, x1 doesn't count.
-      float x1 = Dot(dbf, MakeConstSpan(q.Row(0) + q_offsets[1], qkv_dim), 0,
-                     k.Row(k_pos), qkv_dim);
-      SingleFlashAttentionStep(x1, activations.config.att_cap,
-                               state.row_states[1].max, state.row_states[1].d,
-                               v.Row(k_pos), v.Cols(),
-                               att_out.Row(0) + out_offsets[1]);
-    }
-    if (position <= last_pos[2]) {
-      // Past the last position, x2 doesn't count.
-      float x2 = Dot(dbf, MakeConstSpan(q.Row(0) + q_offsets[2], qkv_dim), 0,
-                     k.Row(k_pos), qkv_dim);
-      SingleFlashAttentionStep(x2, activations.config.att_cap,
-                               state.row_states[2].max, state.row_states[2].d,
-                               v.Row(k_pos), v.Cols(),
-                               att_out.Row(0) + out_offsets[2]);
-    }
-    if (position <= last_pos[3]) {
-      // Past the last position, x3 doesn't count.
-      float x3 = Dot(dbf, MakeConstSpan(q.Row(0) + q_offsets[3], qkv_dim), 0,
-                     k.Row(k_pos), qkv_dim);
-      SingleFlashAttentionStep(x3, activations.config.att_cap,
-                               state.row_states[3].max, state.row_states[3].d,
-                               v.Row(k_pos), v.Cols(),
-                               att_out.Row(0) + out_offsets[3]);
-    }
-    ++position;
   }
   return state;
 }
 
-// Rounds n to a number that can be used as the number of Q rows in a tile
-// of flash attention.
-static size_t RoundToSuitablePowerOf2(size_t n) {
-  if (n < 4) return 1;
-  if (n < 8) return 4;
-  if (n < 16) return 8;
-  if (n < 32) return 16;
-  return 32;
-}
-
 // The vertical tile size is determined by the ability to use tiling and the
 // target_parallelism. In practice the possible tile sizes in order of
-// preference for efficiency are kNF, 4, 1, where kNF is likely to be 4 8 or
-// 16. The final tile size is chosen to be the largest possible that allows
-// for target_parallelism parallel tasks.
+// preference for efficiency are 8, 4, 1. The final tile size is chosen to be
+// the largest possible that allows for target_parallelism parallel tasks.
 size_t GetVTileSize(size_t kNF, size_t num_head_groups, size_t num_tokens,
                     size_t total_tasks, size_t target_parallelism) {
-  const size_t kMaxEqualK =
-      RoundToSuitablePowerOf2(num_head_groups * num_tokens);
-  const size_t kMinTileSize = (total_tasks / 4 >= target_parallelism) ? 4 : 1;
-  return (kNF <= kMaxEqualK && total_tasks / kNF >= target_parallelism)
-             ? kNF
-             : std::min(kMinTileSize, kMaxEqualK);
+  const size_t kMaxEqualK = num_head_groups * num_tokens;
+  if (total_tasks / k8xNFVTileSize >= target_parallelism &&
+      kMaxEqualK >= k8xNFVTileSize && kNF >= k8xNFVTileSize) {
+    return k8xNFVTileSize;
+  }
+  if (total_tasks / k4xNFVTileSize >= target_parallelism &&
+      kMaxEqualK >= k4xNFVTileSize && kNF >= k4xNFVTileSize) {
+    return k4xNFVTileSize;
+  }
+  return 1;
+}
+
+// Clears and fills the params vector with FlashAttentionParams for the given
+// num_tokens, target_parallelism, and layer_idx. Computes tile sizes and
+// offsets for each tile to achieve target_parallelism.
+void ComputeFlashParams(size_t num_tokens, const size_t target_parallelism,
+                        size_t layer_idx, AttentionActivationsPtrs& activations,
+                        QBatch& qbatch, AttentionImpl attention_impl,
+                        std::vector<FlashAttentionParams>& params) {
+  const LayerConfig& layer_config = activations.config.layer_configs[layer_idx];
+  const hwy::Divisor div_qbatch(qbatch.Size());
+  const size_t qkv_dim = layer_config.qkv_dim;
+  using DF = hn::ScalableTag<float>;
+  const DF df;
+  const size_t kNF = hn::Lanes(df);
+
+  // A "head group" in the context of GQA refers to a collection of query
+  // heads that share the same key and value heads.
+  const size_t kHeadGroups = layer_config.heads / layer_config.kv_heads;
+  const size_t cache_layer_size = layer_config.CacheLayerSize();
+  const size_t token_batch = num_tokens * div_qbatch.GetDivisor();
+  const size_t total_tasks = token_batch * layer_config.heads;
+  size_t kVTileSize = GetVTileSize(kNF, kHeadGroups, num_tokens, total_tasks,
+                                   target_parallelism);
+  // All layers should have the same number of heads.
+  HWY_DASSERT(activations.div_heads.GetDivisor() == layer_config.heads);
+  // To maximize adjacent tasks with the same kv matrices, task index is encoded
+  // thus: [qi][kv_head][batch_idx][head_group]. Note that the head index is
+  // split into kv_head and head_group, since the head_group does not affect
+  // the KV matrices, and kv_head does. batch_idx does not affect the KV
+  // matrices, but does affect the last position in the sequence. qi affects
+  // everything.
+  params.clear();
+  for (uint32_t qi = 0; qi < div_qbatch.GetDivisor(); ++qi) {
+    for (uint32_t kv_head = 0; kv_head < layer_config.kv_heads; ++kv_head) {
+      const size_t head_offset = kv_head * qkv_dim * 2;
+      const uint32_t kv_offset = layer_idx * cache_layer_size + head_offset;
+      params.push_back(FlashAttentionParams{
+          .qi_index = qi,
+          .kv_offset = kv_offset,
+      });
+      for (uint32_t batch_idx = 0; batch_idx < num_tokens; ++batch_idx) {
+        const size_t pos = qbatch.Pos(qi) + batch_idx;
+        const size_t start_pos = StartPos(pos, activations.config, layer_idx);
+        size_t last = pos;
+        const size_t prefix_end = qbatch.PrefixEnd(qi);
+        if (prefix_end > 0 && prefix_end - 1 > last) {
+          // last_pos is inclusive.
+          last = prefix_end - 1;
+        }
+        for (size_t head_group = 0; head_group < kHeadGroups; ++head_group) {
+          size_t tasks_remaining = kHeadGroups - head_group +
+                                   kHeadGroups * (num_tokens - 1 - batch_idx);
+          // We want to fill a tile of size kVTileSize or k4xNFVTileSize if
+          // smaller, otherwise everything is singles to the next head group.
+          size_t tasks_required = params.back().v_tile_size < k4xNFVTileSize
+                                      ? k4xNFVTileSize
+                                      : kVTileSize;
+          if (params.back().v_tile_size + tasks_remaining < tasks_required ||
+              params.back().v_tile_size == kVTileSize) {
+            // We don't have enough tasks remaining to fill a tile, or the
+            // current tile is full so start new tile.
+            params.push_back(FlashAttentionParams{
+                .qi_index = qi,
+                .kv_offset = kv_offset,
+            });
+          }
+          const size_t head = head_group + kHeadGroups * kv_head;
+          const size_t tq_idx = div_qbatch.GetDivisor() * batch_idx + qi;
+          auto& param = params.back();
+          size_t offset = param.v_tile_size;
+          param.q_offsets[offset] = activations.q_bf.Row(tq_idx) +
+                                    head * qkv_dim - activations.q_bf.Row(0);
+          param.out_offsets[offset] = activations.att_out.Row(tq_idx) +
+                                      head * qkv_dim -
+                                      activations.att_out.Row(0);
+          param.tq_idx[offset] = tq_idx;
+          param.start_pos[offset] = start_pos;
+          param.min_start_pos = HWY_MIN(param.min_start_pos, start_pos);
+          param.last_pos[offset] = last;
+          param.max_last_pos = HWY_MAX(param.max_last_pos, last);
+          ++param.v_tile_size;
+        }
+      }
+    }
+  }
+}
+
+// Returns the maximum number of tiles needed for any query in the batch.
+size_t GetMaxTiles(const std::vector<FlashAttentionParams>& params,
+                   const size_t kHTileSize) {
+  size_t max_tiles = 0;
+  for (const auto& param : params) {
+    size_t start = param.min_start_pos / kHTileSize;
+    size_t last = param.max_last_pos / kHTileSize;
+    max_tiles = HWY_MAX(last + 1 - start, max_tiles);
+  }
+  return max_tiles;
+}
+
+// Splits params into smaller k-strips to allow for more parallelism.
+// The strips are of size num_tiles_per_task * kHTileSize.
+// split_params is cleared and filled with the split tasks.
+void SplitTasksByKPos(std::vector<FlashAttentionParams>& params,
+                      const size_t kHTileSize, const size_t num_tiles_per_task,
+                      const size_t out_stride,
+                      std::vector<FlashAttentionParams>& split_params) {
+  split_params.clear();
+  for (auto& param : params) {
+    param.split_index = split_params.size();
+    size_t start = param.min_start_pos / kHTileSize;
+    size_t last = param.max_last_pos / kHTileSize;
+    for (size_t tile_pos = start; tile_pos <= last;
+         tile_pos += num_tiles_per_task) {
+      auto& split_param = split_params.emplace_back(param);
+      split_param.i_of_n = (tile_pos - start) / num_tiles_per_task;
+      uint32_t tile_last = (tile_pos + num_tiles_per_task) * kHTileSize - 1;
+      if (tile_last < param.max_last_pos) {
+        split_param.max_last_pos = tile_last;
+        for (auto& last_pos : split_param.last_pos) {
+          last_pos = std::min(last_pos, tile_last);
+        }
+      }
+      uint32_t tile_start = tile_pos * kHTileSize;
+      if (tile_start > param.min_start_pos) {
+        split_param.min_start_pos = tile_start;
+        for (auto& start_pos : split_param.start_pos) {
+          start_pos = std::max(start_pos, tile_start);
+        }
+      }
+      if (split_param.i_of_n > 0) {
+        for (size_t i = 0; i < split_param.v_tile_size; ++i) {
+          split_param.tq_idx[i] =
+              param.tq_idx[i] * AttentionActivations::kThreadReplicationFactor +
+              split_param.i_of_n - 1;
+          split_param.out_offsets[i] =
+              param.out_offsets[i] +
+              (split_param.tq_idx[i] - param.tq_idx[i]) * out_stride;
+        }
+      }
+    }
+  }
+}
+
+// Clears and fills activations.flash_params with FlashAttentionParams for the
+// given num_tokens, target_parallelism, and layer_idx. Computes tile sizes and
+// offsets for each tile to achieve target_parallelism.
+// If the parallelism is insufficient for this processor type, and the sequence
+// length is sufficient, the tiles are upgraded to k4xNFVTileSize and the tasks
+// are split along the k positions to achieve the desired parallelism.
+// If splitting was required, returns that factor by which the tiles were
+// upgraded, k4xNFVTileSize, otherwise returns 0.
+uint32_t ComputeAndSplitFlashParams(const size_t kNF, const size_t num_tokens,
+                                    const size_t target_parallelism,
+                                    size_t layer_idx,
+                                    AttentionActivationsPtrs& activations,
+                                    QBatch& qbatch, ThreadingContext& ctx,
+                                    AttentionImpl attention_impl) {
+  ComputeFlashParams(num_tokens, target_parallelism, layer_idx, activations,
+                     qbatch, attention_impl, activations.flash_params);
+  if (activations.flash_params.size() < ctx.pools.MaxWorkers()) {
+    // Insufficient parallelism for this processor type. Try splitting along the
+    // k positions.
+    size_t max_tiles = GetMaxTiles(activations.flash_params, kNF);
+    size_t desired_tiles_per_task = hwy::DivCeil(
+        activations.flash_params.size() * max_tiles, ctx.pools.MaxWorkers());
+    // The cost of combining split tasks is significant, so we want a minimum
+    // number of tiles per task, and we want to use k4xNFVTileSize if possible.
+    constexpr size_t kMinTilesPerTask = 4;
+    if (desired_tiles_per_task >= k4xNFVTileSize * kMinTilesPerTask) {
+      // We can afford to use k4xNFVTileSize vertically, so recompute params.
+      ComputeFlashParams(num_tokens,
+                         activations.flash_params.size() / k4xNFVTileSize,
+                         layer_idx, activations, qbatch, attention_impl,
+                         activations.flash_params);
+      desired_tiles_per_task =
+          hwy::DivCeil(desired_tiles_per_task, k4xNFVTileSize);
+      SplitTasksByKPos(activations.flash_params, kNF, desired_tiles_per_task,
+                       activations.att_out_reps.Stride(),
+                       activations.split_flash_params);
+      return k4xNFVTileSize;
+    }
+  }
+  return 0;
+}
+
+// Combines results from split tasks, processing kNumNF * NF qkv values where
+// kNumNF can be 1 4 or 16. This enables the intermediate results to be held in
+// registers, which speeds up the combination step significantly.
+template <size_t kNumNF>
+void CombineSplitTasks1416(hwy::Span<const FlashAttentionParams> params,
+                           size_t tile_pos, size_t qkv_offset,
+                           AttentionActivationsPtrs& activations) {
+  using DF = hn::ScalableTag<float>;
+  const DF df;
+  using VF = hn::Vec<DF>;
+  const size_t kNF = hn::Lanes(df);
+  float overall_m = params[0].end_state.row_states[tile_pos].max;
+  float overall_d = params[0].end_state.row_states[tile_pos].d;
+  float* HWY_RESTRICT att_out =
+      activations.att_out.Row(0) + params[0].out_offsets[tile_pos] + qkv_offset;
+  VF result_0 = hn::Load(df, att_out);
+  VF result_1, result_2, result_3, result_4, result_5, result_6, result_7;
+  VF result_8, result_9, result_10, result_11, result_12, result_13, result_14;
+  VF result_15;
+  if constexpr (kNumNF > 1) {
+    result_1 = hn::Load(df, att_out + kNF);
+    result_2 = hn::Load(df, att_out + 2 * kNF);
+    result_3 = hn::Load(df, att_out + 3 * kNF);
+  }
+  if constexpr (kNumNF == 16) {
+    result_4 = hn::Load(df, att_out + 4 * kNF);
+    result_5 = hn::Load(df, att_out + 5 * kNF);
+    result_6 = hn::Load(df, att_out + 6 * kNF);
+    result_7 = hn::Load(df, att_out + 7 * kNF);
+    result_8 = hn::Load(df, att_out + 8 * kNF);
+    result_9 = hn::Load(df, att_out + 9 * kNF);
+    result_10 = hn::Load(df, att_out + 10 * kNF);
+    result_11 = hn::Load(df, att_out + 11 * kNF);
+    result_12 = hn::Load(df, att_out + 12 * kNF);
+    result_13 = hn::Load(df, att_out + 13 * kNF);
+    result_14 = hn::Load(df, att_out + 14 * kNF);
+    result_15 = hn::Load(df, att_out + 15 * kNF);
+  }
+  for (size_t i = 1; i < params.size() && params[i].i_of_n > 0; ++i) {
+    float m = params[i].end_state.row_states[tile_pos].max;
+    float d = params[i].end_state.row_states[tile_pos].d;
+    float new_m = std::max(overall_m, m);
+    // Scale factor for existing total given the change in max.
+    float old_scale = overall_d * std::exp(overall_m - new_m);
+    // Scale factor for new group to add.
+    float new_scale = d * std::exp(m - new_m);
+    float new_d = old_scale + new_scale;
+    float one_over_d = 1.0f / new_d;
+    old_scale *= one_over_d;
+    new_scale *= one_over_d;
+    overall_m = new_m;
+    overall_d = new_d;
+    float* HWY_RESTRICT att_in = activations.att_out_reps.Row(0) +
+                                 params[i].out_offsets[tile_pos] + qkv_offset;
+    VF old_scale_vec = hn::Set(df, old_scale);
+    VF new_scale_vec = hn::Set(df, new_scale);
+    result_0 = hn::Mul(result_0, old_scale_vec);
+    result_0 = hn::MulAdd(hn::Load(df, att_in), new_scale_vec, result_0);
+    if constexpr (kNumNF > 1) {
+      result_1 = hn::Mul(result_1, old_scale_vec);
+      result_2 = hn::Mul(result_2, old_scale_vec);
+      result_3 = hn::Mul(result_3, old_scale_vec);
+      result_1 =
+          hn::MulAdd(hn::Load(df, att_in + kNF), new_scale_vec, result_1);
+      result_2 =
+          hn::MulAdd(hn::Load(df, att_in + 2 * kNF), new_scale_vec, result_2);
+      result_3 =
+          hn::MulAdd(hn::Load(df, att_in + 3 * kNF), new_scale_vec, result_3);
+    }
+    if constexpr (kNumNF == 16) {
+      result_4 = hn::Mul(result_4, old_scale_vec);
+      result_5 = hn::Mul(result_5, old_scale_vec);
+      result_6 = hn::Mul(result_6, old_scale_vec);
+      result_7 = hn::Mul(result_7, old_scale_vec);
+      result_8 = hn::Mul(result_8, old_scale_vec);
+      result_9 = hn::Mul(result_9, old_scale_vec);
+      result_10 = hn::Mul(result_10, old_scale_vec);
+      result_11 = hn::Mul(result_11, old_scale_vec);
+      result_12 = hn::Mul(result_12, old_scale_vec);
+      result_13 = hn::Mul(result_13, old_scale_vec);
+      result_14 = hn::Mul(result_14, old_scale_vec);
+      result_15 = hn::Mul(result_15, old_scale_vec);
+      result_4 =
+          hn::MulAdd(hn::Load(df, att_in + 4 * kNF), new_scale_vec, result_4);
+      result_5 =
+          hn::MulAdd(hn::Load(df, att_in + 5 * kNF), new_scale_vec, result_5);
+      result_6 =
+          hn::MulAdd(hn::Load(df, att_in + 6 * kNF), new_scale_vec, result_6);
+      result_7 =
+          hn::MulAdd(hn::Load(df, att_in + 7 * kNF), new_scale_vec, result_7);
+      result_8 =
+          hn::MulAdd(hn::Load(df, att_in + 8 * kNF), new_scale_vec, result_8);
+      result_9 =
+          hn::MulAdd(hn::Load(df, att_in + 9 * kNF), new_scale_vec, result_9);
+      result_10 =
+          hn::MulAdd(hn::Load(df, att_in + 10 * kNF), new_scale_vec, result_10);
+      result_11 =
+          hn::MulAdd(hn::Load(df, att_in + 11 * kNF), new_scale_vec, result_11);
+      result_12 =
+          hn::MulAdd(hn::Load(df, att_in + 12 * kNF), new_scale_vec, result_12);
+      result_13 =
+          hn::MulAdd(hn::Load(df, att_in + 13 * kNF), new_scale_vec, result_13);
+      result_14 =
+          hn::MulAdd(hn::Load(df, att_in + 14 * kNF), new_scale_vec, result_14);
+      result_15 =
+          hn::MulAdd(hn::Load(df, att_in + 15 * kNF), new_scale_vec, result_15);
+    }
+  }
+  hn::Store(result_0, df, att_out);
+  if constexpr (kNumNF > 1) {
+    hn::Store(result_1, df, att_out + kNF);
+    hn::Store(result_2, df, att_out + 2 * kNF);
+    hn::Store(result_3, df, att_out + 3 * kNF);
+  }
+  if constexpr (kNumNF == 16) {
+    hn::Store(result_4, df, att_out + 4 * kNF);
+    hn::Store(result_5, df, att_out + 5 * kNF);
+    hn::Store(result_6, df, att_out + 6 * kNF);
+    hn::Store(result_7, df, att_out + 7 * kNF);
+    hn::Store(result_8, df, att_out + 8 * kNF);
+    hn::Store(result_9, df, att_out + 9 * kNF);
+    hn::Store(result_10, df, att_out + 10 * kNF);
+    hn::Store(result_11, df, att_out + 11 * kNF);
+    hn::Store(result_12, df, att_out + 12 * kNF);
+    hn::Store(result_13, df, att_out + 13 * kNF);
+    hn::Store(result_14, df, att_out + 14 * kNF);
+    hn::Store(result_15, df, att_out + 15 * kNF);
+  }
+}
+
+// Recombines results from split tasks, activations.att_out_reps ->
+// activations.att_out. Instead of repeatedly calling MultiplyByConstAndAdd,
+// which reads/writes the sum each time, the result is kept entirely in
+// registers, and the task is split into 16NF, 4NF, and NF chunks, so that there
+// are enough registers to hold the intermediate results.
+void CombineSplitTasks(size_t qkv_dim, uint32_t tile_factor,
+                       AttentionActivationsPtrs& activations,
+                       ThreadingContext& ctx) {
+  GCPP_ZONE(ctx, 0, Zones::kFlashAttentionCombineSplit);
+  using DF = hn::ScalableTag<float>;
+  const DF df;
+  const size_t kNF = hn::Lanes(df);
+  uint32_t num_16 = qkv_dim / (16 * kNF);
+  uint32_t num_4 = (qkv_dim - kNF * 16 * num_16) / (4 * kNF);
+  uint32_t num_1 = hwy::DivCeil(qkv_dim - kNF * (16 * num_16 + 4 * num_4), kNF);
+  uint32_t tasks_per_qkv = num_16 + num_4 + num_1;
+  ParallelFor(
+      Parallelism::kFlat,
+      activations.flash_params.size() * tasks_per_qkv * tile_factor, ctx,
+      /*cluster_idx=*/0, Callers::kFlashAttention,
+      [&](size_t p, size_t worker) {
+        uint32_t tile = p / tasks_per_qkv;
+        uint32_t p_idx =
+            activations.flash_params[tile / tile_factor].split_index;
+        const auto& param = activations.split_flash_params[p_idx];
+        size_t remaining_params = activations.split_flash_params.size() - p_idx;
+        tile %= tile_factor;
+        if (tile >= param.v_tile_size) return;
+        int32_t qkv_task = p % tasks_per_qkv;
+        if (qkv_task < num_16) {
+          uint32_t qkv_offset = qkv_task * 16 * kNF;
+          CombineSplitTasks1416<16>(
+              hwy::Span<const FlashAttentionParams>(&param, remaining_params),
+              tile, qkv_offset, activations);
+        } else if (qkv_task < num_16 + num_4) {
+          uint32_t qkv_offset = (num_16 * 16 + (qkv_task - num_16) * 4) * kNF;
+          CombineSplitTasks1416<4>(
+              hwy::Span<const FlashAttentionParams>(&param, remaining_params),
+              tile, qkv_offset, activations);
+        } else {
+          uint32_t qkv_offset =
+              (num_16 * 16 + num_4 * 4 + (qkv_task - num_16 - num_4)) * kNF;
+          CombineSplitTasks1416<1>(
+              hwy::Span<const FlashAttentionParams>(&param, remaining_params),
+              tile, qkv_offset, activations);
+        }
+      });
 }
 
 // The nominal aim of attention is to combine 3 inputs Q[L,D], K[L,D], V[L,D]
@@ -756,49 +1236,28 @@ size_t GetVTileSize(size_t kNF, size_t num_head_groups, size_t num_tokens,
 // the one row of O takes L(4D+3) reads and L(D+3) writes.
 // For the whole of Q, this is L^2(4D+3) reads and L^2(D+3) writes.
 //
-// Flash attention fuses these operations together, and has 3 operating modes:
-// 1. NF rows of the result computed using tiles of registers of shape NFx8.
-// 2. 4 rows of the result computed using tiles of registers of shape 4xNF.
-// 3. One row (of Q and the result) at a time.
-// In all cases the intermediate result (Q.KT) is never stored to memory.
-// NF is the number of float lanes in a register, being 16 for AVX3. The softmax
-// is converted to streaming form using the algorithm from:
-// https://courses.cs.washington.edu/courses/cse599m/23sp/notes/flashattn.pdf.
-// Q is transposed to Q_T[D,L] to make the dot product computation efficient.
-//
-// In mode 1:
-// QDotKTileFloat computes NF Q rows x 8 K timesteps of Q.K dot products in one
-// go, reducing reads of Q by 8 and reads of K by NF. The streaming softmax is
-// computed entirely in registers, and a further NF registers to accumulate the
-// results of the product of the softmax and V, reduce the number of reads of V
-// by NF, and the reads/writes of O by 8.
-// The reads are thus reduced to 2DL^2(1/8+1/NF) and writes reduced to DL^2/8,
-// which on AVX3 is an overall reduction by about a factor of 10.
-// Mode 1 can only be accessed if there is a large Qbatch size, or in multi-turn
-// prefill, since in other cases, there is either a single K timestep (prefill)
-// or a single num_heads set of Q rows (decode).
-//
-// In mode 2, the 4 rows of Q are computed against NF K timesteps in a tile,
-// reducing the reads of Q by NF, and the reads of K by 4. The softmax and
-// accumulation of the result is done in registers, cutting the reads of V by 4.
-// The reads/writes of O are reduced by a factor of NF.
-// The overall reduction is limited by the need to use gather to load K.
-// Transposing K would be possible, but is complicated by the wraparound.
-// Mode 2 can be used in all cases when there are at least 4 attention heads,
-// but it may be prefereable to use mode 3 when the batch size is small to
-// maximise parallelism.
-//
-// In mode 3, a single row of Q is computed against a single K timestep at a
-// time, using SingleFlashAttention. In this case there is no reduction in the
-// reads of Q or K, or V, or O, but the reads/writes of the intermediate A are
-// still eliminated.
+// Flash attention fuses these operations together, and operates on tiles of
+// n Q rows x NF K positions, accumulated in n registers, where n is in
+// {1, 4, 8} and NF is the number of float lanes in a register, being 16 for
+// AVX3. This reduces the number of reads of Q by NF and reads of K by n. The
+// softmax is converted to streaming form using the algorithm from:
+// https://courses.cs.washington.edu/courses/cse599m/23sp/notes/flashattn.pdf,
+// which eliminates the need to store A to memory. The accumulated Q.KT result
+// is passed via the streaming softmax directly to the A.V step.
+// To make the dot product computation more efficient, Q, K, and V are stored
+// as BF16 and K is transposed to shape:
+//   [seq_len / NF, layers * kv_heads * qkv_dim/2 * NF * 2], where the /2, *2
+//   represents that pairs of qkv_dim elements are kept together to make best
+//   use of BF16 dot product instructions, where each pair of adjacent BF16
+//   values from Q and K are mul-added into a single F32 result.
 //
 // A further complication is that real attention is not as simple as documented
 // in the paper and above. There are multiple query heads, differing KV, and
-// different sequence lengths, so a lot of the work in FlashAttention is making
-// sure that a collection of q rows with the same KV and sequence length are
-// grouped together so that mode 1 or 2 can be used, and choosing which of the
-// 3 modes to use for best efficiency.
+// different sequence lengths, and the difference between prefill and decode,
+// so a lot of the work in FlashAttention is making sure that a collection of q
+// rows with the same KV and sequence length are grouped together so that the
+// largest possible tiles can be used. This is dealt with by the
+// ComputeAndSplitFlashParams() function.
 void FlashAttention(const size_t num_tokens, const size_t target_parallelism,
                     const size_t layer_idx, const MatPtr& query_norm_scale,
                     AttentionActivationsPtrs& activations, QBatch& qbatch,
@@ -806,8 +1265,16 @@ void FlashAttention(const size_t num_tokens, const size_t target_parallelism,
   GCPP_ZONE(ctx, 0, Zones::kFlashAttentionInclusive);
   RMSNormAndPositionalEncoding(num_tokens, qbatch, activations.q,
                                query_norm_scale, layer_idx, activations, ctx);
-  const hwy::Divisor div_qbatch(qbatch.Size());
+  const LayerConfig& layer_config = activations.config.layer_configs[layer_idx];
+  const size_t qkv_dim = layer_config.qkv_dim;
+  const size_t seq_len =
+      static_cast<size_t>(activations.div_seq_len.GetDivisor());
+
+  using DF = hn::ScalableTag<float>;
+  const DF df;
+  const size_t kNF = hn::Lanes(df);
   // Compress q to q_bf.
+  // TODO(rays): Move this into RMSNormAndPositionalEncoding().
   ParallelFor(
       Parallelism::kWithinCluster, activations.q.Rows(), ctx,
       /*cluster_idx=*/0, Callers::kFlashAttention,
@@ -818,168 +1285,53 @@ void FlashAttention(const size_t num_tokens, const size_t target_parallelism,
             df, activations.q.Row(row), activations.q.Cols(), tls,
             MakeSpan(activations.q_bf.Row(row), activations.q_bf.Cols()), 0);
       });
-  const LayerConfig& layer_config = activations.config.layer_configs[layer_idx];
-  const size_t qkv_dim = layer_config.qkv_dim;
-
-  // A "head group" in the context of GQA refers to a collection of query
-  // heads that share the same key and value heads.
-  const size_t kHeadGroups = layer_config.heads / layer_config.kv_heads;
-  const size_t cache_layer_size = layer_config.CacheLayerSize();
-  const size_t seq_len =
-      static_cast<size_t>(activations.div_seq_len.GetDivisor());
-  const size_t token_batch = num_tokens * div_qbatch.GetDivisor();
-  const size_t total_tasks = token_batch * layer_config.heads;
-
-  using DF = hn::ScalableTag<float>;
-  const DF df;
-  const size_t kNF = hn::Lanes(df);
-  constexpr size_t kMaxNF = hn::MaxLanes(df);
-  HWY_DASSERT(kNF <= kMaxNF);
-  const size_t kVTileSize = GetVTileSize(kNF, kHeadGroups, num_tokens,
-                                         total_tasks, target_parallelism);
-  // Only transpose Q if we are using tiling.
-  if (kVTileSize == kNF) {
-    size_t max_last = 0, min_start = std::numeric_limits<size_t>::max();
-    for (size_t qi = 0; qi < qbatch.Size(); ++qi) {
-      size_t pos = qbatch.Pos(qi);
-      const size_t start = StartPos(pos, activations.config, layer_idx);
-      pos += num_tokens - 1;
-      const size_t end = qbatch.PrefixEnd(qi);
-      if (end > 0 && end - 1 > pos) {
-        pos = end - 1;
-      }
-      max_last = std::max(max_last, pos);
-      min_start = std::min(min_start, start);
-    }
-    if (max_last - min_start + 1 >= kNFx8HTileSize) {
-      // q has shape [batch, qbatch][head, qkv_dim].
-      // We transpose it to [qkv_dim][qbatch, head, batch] in order to make the
-      // maximum possible number of consecutive columns have the same KV
-      // matrices. Each thread will process a tile of NF columns of QT so the
-      // starting column index of QT is just the task index * kVTileSize.
-      TransposeQ(activations.q, activations.q_T, qbatch.Size(), ctx);
-    }
-  }
-  const size_t num_thread_tasks = hwy::DivCeil(total_tasks, kVTileSize);
-  const hwy::Divisor div_tokens(num_tokens);
-  // All layers should have the same number of heads.
-  HWY_DASSERT(activations.div_heads.GetDivisor() == layer_config.heads);
+  int tile_factor =
+      ComputeAndSplitFlashParams(kNF, num_tokens, target_parallelism, layer_idx,
+                                 activations, qbatch, ctx, attention_impl);
+  auto& params = tile_factor >= 1 ? activations.split_flash_params
+                                  : activations.flash_params;
+  size_t num_tasks = params.size();
 
   // For each head/token/query, compute fused flash Q.K, softmax and weighted V.
   const auto func = [&](const size_t task, size_t worker) HWY_ATTR {
     GCPP_ZONE(ctx, worker, Zones::kFlashAttentionFlashAttention);
-    // Offsets into original Q for each row in the tile.
-    uint32_t q_offsets[kMaxNF];
-    // Offsets into att_out for each row in the tile.
-    uint32_t out_offsets[kMaxNF];
-    // Start positions for each row in the tile.
-    size_t start_positions[kMaxNF];
-    // Last positions for each row in the tile. Inclusive.
-    uint32_t last_pos[kMaxNF];
-    // min and max last positions across all rows in the tile determines when
-    // TileFlashAttention switches to single vector mode to handle the
-    // ragged sequence lengths.
-    size_t min_last_pos = std::numeric_limits<size_t>::max();
-    size_t max_last_pos = 0;
-    // Indices into the qbatch.KV for each row in the tile.
-    size_t qi_indices[kMaxNF];
-    // Indices into the kv_cache for each row in the tile.
-    size_t kv_offsets[kMaxNF];
-    // first_task is [qbatch, head, token].
-    const size_t first_task = task * kVTileSize;
-    const size_t last_task = first_task + kVTileSize - 1;
-    bool use_tile_attention = kVTileSize > 1 && last_task < total_tasks;
-    for (size_t offset = 0;
-         offset < kVTileSize && first_task + offset < total_tasks; ++offset) {
-      const size_t batch_idx = div_tokens.Remainder(first_task + offset);
-      const size_t qh = div_tokens.Divide(first_task + offset);
-      const size_t head = activations.div_heads.Remainder(qh);
-      const size_t qi = activations.div_heads.Divide(qh);
-      const size_t tq_idx = div_qbatch.GetDivisor() * batch_idx + qi;
-      qi_indices[offset] = qi;
-
-      // Find the token position in the query and calculate
-      // the range of cache positions to attend to.
-      const size_t pos = qbatch.Pos(qi) + batch_idx;
-      const size_t start_pos = StartPos(pos, activations.config, layer_idx);
-      start_positions[offset] = start_pos;
-      size_t last = pos;
-      const size_t prefix_end = qbatch.PrefixEnd(qi);
-      if (prefix_end > 0 && prefix_end - 1 > last) {
-        // last_pos in `TileFlashAttention` is inclusive.
-        last = prefix_end - 1;
-      }
-      last_pos[offset] = last;
-      min_last_pos = HWY_MIN(min_last_pos, last);
-      max_last_pos = HWY_MAX(max_last_pos, last);
-      q_offsets[offset] = activations.q_bf.Row(tq_idx) + head * qkv_dim -
-                          activations.q_bf.Row(0);
-      out_offsets[offset] = activations.att_out.Row(tq_idx) + head * qkv_dim -
-                            activations.att_out.Row(0);
-      const size_t kv_index = head / kHeadGroups;
-      const size_t head_offset = kv_index * qkv_dim * 2;
-      kv_offsets[offset] = layer_idx * cache_layer_size + head_offset;
-      // If any of the parameters in this if statement differ within this task,
-      // then we can't use TileFlashAttention. TileFlashAttention requires that
-      // all rows in the tile have the same K and V matrices, and Q starts at
-      // the same position. The end positions do not have to be the equal.
-      if (start_positions[offset] != start_positions[0] ||
-          qi_indices[offset] != qi_indices[0] ||
-          kv_offsets[offset] != kv_offsets[0]) {
-        use_tile_attention = false;
-      }
-    }
-    for (size_t offset = 0;
-         offset < kVTileSize && first_task + offset < total_tasks; ++offset) {
-      auto& kv_cache = qbatch.KV(qi_indices[offset]).kv_cache;
-      MatPtrT<KV_t> k("k_view", Extents2D(seq_len, qkv_dim));
-      k.SetPtr(kv_cache.Row(0) + kv_offsets[offset], kv_cache.Stride());
-      MatPtrT<KV_t> v("v_view", Extents2D(seq_len, qkv_dim));
-      v.SetPtr(kv_cache.Row(0) + kv_offsets[offset] + qkv_dim,
-               kv_cache.Stride());
-      if (use_tile_attention) {
-        // To avoid duplicating the code to setup K and V, the call to
-        // TileFlashAttention is inside the loop over tasks, even though it
-        // handles all rows in the task at once.
-        StridedView<BF16> qT =
-            StridedView<BF16>(activations.q_T.Row(0) + first_task, kVTileSize,
-                              activations.q_T.Stride());
-        if (kVTileSize == kNF) {
-          // We can still use TileFlashAttention even if we didn't transpose Q
-          // above. The condition used for transposing Q above is more general
-          // and easier to compute than the condition used within
-          // TileFlashAttention that min_last_pos - start_positions[offset] <
-          // kNFx8HTileSize. In this case, qT is never used. Some tasks might
-          // use qT and some might not, which is why the more general condition
-          // is used above to catch all cases where qT will be used.
-          TileFlashAttention(activations.q_bf, q_offsets, qT, k,
-                             start_positions[offset], last_pos, min_last_pos,
-                             max_last_pos, v, layer_idx, activations,
-                             activations.att_out, out_offsets, ctx, worker);
-        } else if (kVTileSize == 4) {
-          TileFlashAttention4(activations.q_bf, q_offsets, k,
-                              start_positions[offset], last_pos, min_last_pos,
-                              max_last_pos, v, layer_idx, activations,
-                              activations.att_out, out_offsets, ctx, worker);
-        } else {
-          HWY_UNREACHABLE;
-        }
-        break;
-      } else {
-        SingleFlashAttention(start_positions[offset], last_pos[offset],
-                             activations.q_bf.Row(0) + q_offsets[offset], k, v,
-                             layer_idx, activations,
-                             activations.att_out.Row(0) + out_offsets[offset],
-                             ctx, worker);
-      }
+    auto& param = params[task];
+    auto& kv_cache = qbatch.KV(param.qi_index).kv_cache;
+    auto& kT_cache = qbatch.KV(param.qi_index).k_cache;
+    MatPtrT<KV_t> kT("k_T_view", Extents2D(hwy::DivCeil(seq_len, 2 * kNF),
+                                           qkv_dim * 2 * kNF));
+    kT.SetPtr(kT_cache.Row(0) + param.kv_offset * kNF, kT_cache.Stride());
+    MatPtrT<KV_t> v("v_view", Extents2D(seq_len, qkv_dim));
+    v.SetPtr(kv_cache.Row(0) + param.kv_offset + qkv_dim, kv_cache.Stride());
+    auto& vT_cache = qbatch.KV(param.qi_index).v_cache;
+    MatPtrT<KV_t> vT("v_T_view", Extents2D(hwy::DivCeil(seq_len, 2 * kNF),
+                                           qkv_dim * 2 * kNF));
+    vT.SetPtr(vT_cache.Row(0) + param.kv_offset * kNF, vT_cache.Stride());
+    MatPtrT<float>& att_out =
+        param.i_of_n == 0 ? activations.att_out : activations.att_out_reps;
+    if (param.v_tile_size == k8xNFVTileSize) {
+      param.end_state = TileFlashAttention148<k8xNFVTileSize>(
+          param, activations.q_bf, kT, vT, layer_idx, activations, att_out,
+          qkv_dim, ctx, worker, attention_impl);
+    } else if (param.v_tile_size == k4xNFVTileSize) {
+      param.end_state = TileFlashAttention148<k4xNFVTileSize>(
+          param, activations.q_bf, kT, vT, layer_idx, activations, att_out,
+          qkv_dim, ctx, worker, attention_impl);
+    } else {
+      param.end_state = TileFlashAttention148<1>(
+          param, activations.q_bf, kT, vT, layer_idx, activations, att_out,
+          qkv_dim, ctx, worker, attention_impl);
     }
   };
 
   {
     PROFILER_ZONE("Gen.FlashAttention.ForkJoin");
     // Full parallelism is helpful, SmallParallelFor is insufficient.
-    HierarchicalParallelFor(num_thread_tasks, ctx, Callers::kFlashAttention,
-                            func);
+    HierarchicalParallelFor(num_tasks, ctx, Callers::kFlashAttention, func);
+  }
+  if (tile_factor >= 1) {
+    // Run the flash attention correction on the partial outputs.
+    CombineSplitTasks(qkv_dim, tile_factor, activations, ctx);
   }
 }
 

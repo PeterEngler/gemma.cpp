@@ -17,14 +17,14 @@ const char* ZoneName(Zones zone) {
       return "FlashAttention.Inclusive";
     case Zones::kFlashAttentionRmsNormAndPositionalEncoding:
       return "FlashAttention.RMSNormAndPositionalEncoding";
-    case Zones::kFlashAttentionSingleFlashAttention:
-      return "FlashAttention.SingleFlashAttention";
-    case Zones::kFlashAttentionTileFlashAttention:
-      return "FlashAttention.TileFlashAttention";
+    case Zones::kFlashAttentionTileFlashAttention1:
+      return "FlashAttention.TileFlashAttention1";
     case Zones::kFlashAttentionTileFlashAttention4:
       return "FlashAttention.TileFlashAttention4";
-    case Zones::kFlashAttentionTransposeQ:
-      return "FlashAttention.TransposeQ";
+    case Zones::kFlashAttentionTileFlashAttention8:
+      return "FlashAttention.TileFlashAttention8";
+    case Zones::kFlashAttentionCombineSplit:
+      return "FlashAttention.CombineSplit";
     case Zones::kGenActivation:
       return "Gen.Activation";
     case Zones::kGenActivationFused:

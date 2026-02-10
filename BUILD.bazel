@@ -547,6 +547,7 @@ cc_library(
     deps = [
         ":basics",
         ":configs",
+        ":flash_structs",
         ":gemma_args",
         ":kv_cache",
         ":mat",
@@ -595,6 +596,11 @@ cc_test(
 INTERNAL_DEPS = []
 
 cc_library(
+    name = "flash_structs",
+    hdrs = ["gemma/flash_structs.h"],
+)
+
+cc_library(
     name = "attention",
     srcs = [
         "gemma/attention.cc",
@@ -603,7 +609,6 @@ cc_library(
     hdrs = [
         "gemma/attention.h",
         "gemma/flash_attention.h",
-        "gemma/flash_structs.h",
     ],
     textual_hdrs = [
         "gemma/gemma-inl.h",
@@ -612,6 +617,7 @@ cc_library(
         ":activations",
         ":basics",
         ":configs",
+        ":flash_structs",
         ":kv_cache",
         ":mat",
         ":matmul",

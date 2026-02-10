@@ -106,7 +106,8 @@ template <typename T>
 void FillMatPtrT(MatPtrT<T>& mat) {
   for (int i = 0; i < mat.Rows(); ++i) {
     for (int j = 0; j < mat.Cols(); ++j) {
-      mat.Row(i)[j] = hwy::Unpredictable1() * 0.01f * (i + j + 1);
+      mat.Row(i)[j] =
+          hwy::ConvertScalarTo<T>(hwy::Unpredictable1() * 0.01f * (i + j + 1));
     }
   }
 }

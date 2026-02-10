@@ -31,6 +31,13 @@ namespace gcpp {
 // Passed to HWY_VISIT_TARGETS; declares for one target.
 #define GEMMA_DECL_ATTENTION(TARGET, NAMESPACE)                               \
   namespace NAMESPACE {                                                       \
+  size_t FloatsPerVector();                                                   \
+                                                                              \
+  void MaybeReshapeCache(const MatPtrT<KV_t>& kv, MatPtrT<KV_t>& cache);      \
+                                                                              \
+  void TransposeKVCacheRow(const KV_t* HWY_RESTRICT kv, KV_t* HWY_RESTRICT k, \
+                           KV_t* HWY_RESTRICT v, size_t qkv_dim);             \
+                                                                              \
   void PositionalEncodingQK(float* qk, size_t layer_idx,                      \
                             const AttentionActivationsPtrs& activations,      \
                             ThreadingContext& ctx, size_t worker, size_t pos, \

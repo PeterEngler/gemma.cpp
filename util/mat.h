@@ -202,6 +202,17 @@ class MatPtr : public IFields {
     override_rows_ = static_cast<uint32_t>(rows);
   }
 
+  // Changes the number of rows and columns without reallocating the memory.
+  // Increases cols by factor and reduces rows by factor.
+  // The rows must be divisible by factor and the matrix must be packed.
+  void ReshapePackedRowsToCols(size_t factor) {
+    HWY_ASSERT(IsPacked());
+    HWY_ASSERT(private_rows_ % factor == 0);
+    private_rows_ /= factor;
+    cols_ *= factor;
+    stride_ *= factor;
+  }
+
   // Offset by which to advance pointers to the next row.
   size_t Stride() const { return stride_; }
 

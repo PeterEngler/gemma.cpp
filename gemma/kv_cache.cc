@@ -43,6 +43,17 @@ static size_t CappedSeqLen(const ModelConfig& config,
 
 KVCache::KVCache(const Extents2D& kv_extents, const Allocator& allocator)
     : kv_cache("kv", kv_extents, allocator, MatPadding::kOdd),
+      // WARNING: the rows and cols of k_cache and v_cache will be modified
+      // before use!
+      // The rows will be reduced by a factor of 2xkFloatsPerVector, and the
+      // cols will be increased by 2xkFloatsPerVector on first use. This is to
+      // avoid making KVCache another class that has to be duplicated for each
+      // machine architecture, since kFloatsPerVector is architecture dependent.
+      // The change is shape is safe only if the padding is kPacked.
+      k_cache("k", Extents2D(kv_extents.rows, kv_extents.cols / 2), allocator,
+              MatPadding::kPacked),
+      v_cache("v", Extents2D(kv_extents.rows, kv_extents.cols / 2), allocator,
+              MatPadding::kPacked),
       allocator_(allocator) {}
 
 KVCache::KVCache(const ModelConfig& config, const InferenceArgs& inference_args,
@@ -55,6 +66,8 @@ KVCache KVCache::Copy() {
   KVCache copy(kv_cache.Extents(), allocator_);
 
   CopyMat(kv_cache, copy.kv_cache);
+  CopyMat(k_cache, copy.k_cache);
+  CopyMat(v_cache, copy.v_cache);
   return copy;
 }
 

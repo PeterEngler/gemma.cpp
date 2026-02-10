@@ -62,16 +62,17 @@ namespace HWY_NAMESPACE {
 
 using FloatPtr = hwy::AlignedFreeUniquePtr<float[]>;
 
-void SetMat(const size_t offset, MatPtrT<float>& mat) {
+template <typename T>
+void SetMat(const size_t offset, MatPtrT<T>& mat) {
   const size_t kOuter = mat.Extents().rows;
   const size_t kInner = mat.Extents().cols;
   const float i_scale = 1.0f / kInner;
   const float j_scale = 1.0f / kOuter;
   for (size_t i = 0; i < kOuter; ++i) {
-    float* row = mat.Row(i);
+    T* row = mat.Row(i);
     for (size_t j = 0; j < kInner; ++j) {
-      row[j] =
-          static_cast<float>((i * kInner * i_scale + (j + offset) * j_scale));
+      row[j] = hwy::ConvertScalarTo<T>(
+          static_cast<float>((i * kInner * i_scale + (j + offset) * j_scale)));
     }
   }
 }
@@ -94,14 +95,15 @@ void AssertClose(const MatPtrT<float>& a, const MatPtrT<float>& b) {
       if (rel_abs_delta > 0.0f) {
         rel_abs_delta /= std::max(std::abs(a_row[c]), std::abs(b_row[c]));
       }
-      EXPECT_LT(rel_abs_delta, 1e-5)
+      EXPECT_LT(rel_abs_delta, 1e-3)
           << "a[" << r << "," << c << "]=" << a_row[c] << ", b[" << r << ","
           << c << "]=" << b_row[c];
     }
   }
 }
 
-void TestFlashAttention(size_t target_parallelism) {
+void TestFlashAttention(size_t target_parallelism,
+                        AttentionImpl attention_impl) {
   ThreadingArgs threading_args;
   ThreadingContext ctx(threading_args);
   constexpr size_t kOuter = 1024;
@@ -131,7 +133,8 @@ void TestFlashAttention(size_t target_parallelism) {
   const size_t batch_size = kOuter;
   std::vector<hwy::AlignedFreeUniquePtr<uint8_t*[]>> row_ptrs;
   AttentionActivations attention_storage(config, layer_config, batch_size,
-                                         kOuter, runtime_config, ctx.allocator,
+                                         kOuter, runtime_config,
+                                        ctx.pools.MaxWorkers(), ctx.allocator,
                                          row_ptrs);
   AttentionActivationsPtrs attention(config, kOuter, attention_storage);
   const size_t qkv_dim = layer_config.qkv_dim;
@@ -142,7 +145,10 @@ void TestFlashAttention(size_t target_parallelism) {
   const size_t kHeadGroups = layer_config.heads / layer_config.kv_heads;
   const size_t seq_len =
       static_cast<size_t>(attention.div_seq_len.GetDivisor());
+  MaybeReshapeCache(qbatch.KV(0).kv_cache, qbatch.KV(0).k_cache);
+  MaybeReshapeCache(qbatch.KV(0).kv_cache, qbatch.KV(0).v_cache);
   auto& kvc = qbatch.KV(0).kv_cache;
+  const size_t kFloatsPerTile = 2 * FloatsPerVector();
   for (size_t h = 0; h < layer_config.heads; ++h) {
     // Make strided views into the kv cache for
     // this query and head.
@@ -153,6 +159,17 @@ void TestFlashAttention(size_t target_parallelism) {
     v.SetPtr(kvc.Row(0) + head_offset + qkv_dim, kvc.Stride());
     SetMat(h + layer_config.heads, k);
     SetMat(h + layer_config.heads * 2, v);
+    for (size_t p = 0; p < tokens.size(); ++p) {
+      KV_t* HWY_RESTRICT k_src = k.Row(p);
+      KV_t* HWY_RESTRICT k_dest = qbatch.KV(0).k_cache.Row(p / kFloatsPerTile) +
+                                  head_offset * kFloatsPerTile / 2 +
+                                  p % kFloatsPerTile * 2;
+      KV_t* HWY_RESTRICT v_dest = qbatch.KV(0).v_cache.Row(p / kFloatsPerTile) +
+                                  head_offset * kFloatsPerTile / 2 +
+                                  p % kFloatsPerTile * kFloatsPerTile;
+
+      TransposeKVCacheRow(k_src, k_dest, v_dest, qkv_dim);
+    }
   }
   SetMat(1, attention.q);
   DotSoftmaxWeightedSum(tokens.size(), 0, layers.query_norm_scale, attention,
@@ -167,18 +184,19 @@ void TestFlashAttention(size_t target_parallelism) {
       tokens.size() * div_qbatch.GetDivisor() * layer_config.heads;
   const size_t kVTileSize = GetVTileSize(kNF, kHeadGroups, tokens.size(),
                                          total_tasks, target_parallelism);
-  printf("FlashAttention: target_parallelism=%zu, kNF=%zu, kVTileSize=%zu\n",
-         target_parallelism, kNF, kVTileSize);
+  printf("FlashAttention: parallelism=%zu, kNF=%zu, kVTileSize=%zu, mode %s\n",
+         target_parallelism, kNF, kVTileSize,
+         GetAttentionImplName(attention_impl).c_str());
   FlashAttention(tokens.size(), target_parallelism, 0, layers.query_norm_scale,
-                 attention, qbatch, ctx, AttentionImpl::kFlash);
+                 attention, qbatch, ctx, attention_impl);
   AssertClose(attention.att_out, *saved_att);
   ctx.profiler.PrintResults();
 }
 
 void TestAttention() {
-  TestFlashAttention(8192);
-  TestFlashAttention(2048);
-  TestFlashAttention(256);
+  TestFlashAttention(8192, AttentionImpl::kFlash);
+  TestFlashAttention(2048, AttentionImpl::kFlash);
+  TestFlashAttention(256, AttentionImpl::kFlash);
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)

@@ -190,7 +190,7 @@ HWY_AFTER_NAMESPACE();
 
 namespace gcpp {
 HWY_BEFORE_TEST(FlashAttentionTest);
-// HWY_EXPORT_AND_TEST_P(FlashAttentionTest, TestAttention);
+HWY_EXPORT_AND_TEST_P(FlashAttentionTest, TestAttention);
 HWY_AFTER_TEST();
 
 }  // namespace gcpp

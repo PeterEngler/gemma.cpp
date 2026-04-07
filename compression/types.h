@@ -218,12 +218,25 @@ constexpr bool SupportsPointerArithmetic() {
 }
 
 // Tensor types for loading weights. Not all of these are supported weight
-// types, some are only used for `Activations`.
-enum class Type { kUnknown, kF32, kBF16, kSFP, kNUQ, kF64, kU32, kU64, kI8 };
+// types, some are only used for `Activations`. Append-only.
+enum class Type {
+  kUnknown,
+  kF32,
+  kBF16,
+  kSFP,
+  kNUQ,
+  kF64,
+  kU32,
+  kU64,
+  kI8,
+  kU16,
+  kU8,
+};
 // These are used in `ModelConfig.Specifier`, hence the strings will not
 // change, though new ones may be added.
-static constexpr const char* kTypeStrings[] = {
-    "unknown", "f32", "bf16", "sfp", "nuq", "f64", "u32", "u64", "i8"};
+static constexpr const char* kTypeStrings[] = {"unknown", "f32", "bf16", "sfp",
+                                               "nuq",     "f64", "u32",  "u64",
+                                               "i8",      "u16", "u8"};
 static constexpr size_t kNumTypes =
     sizeof(kTypeStrings) / sizeof(kTypeStrings[0]);
 static constexpr size_t kTypeBits[] = {
@@ -236,6 +249,8 @@ static constexpr size_t kTypeBits[] = {
     8 * sizeof(uint32_t),
     8 * sizeof(uint64_t),
     8 * sizeof(I8Stream),
+    8 * sizeof(uint16_t),
+    8 * sizeof(uint8_t),
 };
 
 static inline bool EnumValid(Type type) {
@@ -244,7 +259,7 @@ static inline bool EnumValid(Type type) {
 
 // Returns a Type enum for the type of the template parameter.
 template <typename PackedT>
-Type TypeEnum() {
+constexpr Type TypeEnum() {
   using Packed = hwy::RemoveCvRef<PackedT>;
   if constexpr (hwy::IsSame<Packed, float>()) {
     return Type::kF32;
@@ -262,8 +277,11 @@ Type TypeEnum() {
     return Type::kU64;
   } else if constexpr (hwy::IsSame<Packed, I8Stream>()) {
     return Type::kI8;
+  } else if constexpr (hwy::IsSame<Packed, uint16_t>()) {
+    return Type::kU16;
+  } else if constexpr (hwy::IsSame<Packed, uint8_t>()) {
+    return Type::kU8;
   } else {
-    HWY_DASSERT(false);
     return Type::kUnknown;
   }
 }

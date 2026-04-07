@@ -17,6 +17,11 @@
 
 #include <stddef.h>
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+#include "compression/types.h"
 #include "gemma/configs.h"
 #include "gemma/gemma_args.h"
 #include "util/mat.h"  // ZeroInit
@@ -50,8 +55,16 @@ KVCache KVCache::Copy() {
   KVCache copy(kv_cache.Extents(), allocator_);
 
   CopyMat(kv_cache, copy.kv_cache);
-
   return copy;
+}
+
+std::vector<KVCachePtr> ToKVCachePtrs(const hwy::Span<KVCache>& kv_caches) {
+  std::vector<KVCachePtr> ptrs;
+  ptrs.reserve(kv_caches.size());
+  for (size_t i = 0; i < kv_caches.size(); ++i) {
+    ptrs.push_back(kv_caches[i].ToPtr());
+  }
+  return ptrs;
 }
 
 }  // namespace gcpp
